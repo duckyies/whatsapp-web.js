@@ -165,6 +165,7 @@ exports.LoadUtils = () => {
         const uploadLimit = window.Store.UploadLimits(messageType);
         return uploadLimit;
     };
+    
     window.WWebJS.sendMessage = async (chat, content, options = {}) => {
         let attOptions = {};
         if (options.attachment) {
@@ -490,7 +491,8 @@ exports.LoadUtils = () => {
         if (forceVoice && mediaData.type === 'audio') {
             mediaData.type = 'ptt';
         }
-            if(mediaData.type === 'ptt' || (mediaData.type === 'audio' && mediaData.mimetype === 'audio/ogg; codecs=opus' && mediaInfo.filesize < maxFileSize)){
+
+        if(mediaData.type === 'ptt' || (mediaData.type === 'audio' && mediaData.mimetype === 'audio/ogg; codecs=opus' && mediaInfo.filesize < maxFileSize)){
             const waveform = mediaObject.contentInfo.waveform;
             mediaData.waveform =
                 waveform ?? await window.WWebJS.generateWaveform(file);
@@ -507,9 +509,14 @@ exports.LoadUtils = () => {
             isViewOnce = false;
         }
 
+        if(!isViewOnce){
+            isViewOnce = false;
+        }
+
         if(mediaInfo.filesize && maxFileSize > mediaInfo.file){
             throw new Error('Media size (' +mediaInfo.filesize +') exceeds current upload limit (' + maxFileSize + ')');
         }
+
         if (!(mediaData.mediaBlob instanceof window.Store.OpaqueData)) {
             mediaData.mediaBlob = await window.Store.OpaqueData.createFromData(mediaData.mediaBlob, mediaData.mediaBlob.type);
         }
@@ -517,7 +524,6 @@ exports.LoadUtils = () => {
         mediaData.renderableUrl = mediaData.mediaBlob.url();
         mediaObject.consolidate(mediaData.toJSON());
         mediaData.mediaBlob.autorelease();
-
         if(mediaInfo.filesize > 50000000){
             uploadedMedia = await window.Store.MediaUpload.uploadMedia({
                 mimetype: mediaData.mimetype,
@@ -539,8 +545,9 @@ exports.LoadUtils = () => {
                 uploadOrigin,
                 forwardedFromWeb
             });
-        }   
-         let mediaEntry = uploadedMedia.mediaEntry;
+        }
+
+        let mediaEntry = uploadedMedia.mediaEntry;
         if (!mediaEntry) {
             if(mediaInfo.filesize > 50000000){
                 uploadedMedia = await window.Store.MediaUpload.uploadMedia({
