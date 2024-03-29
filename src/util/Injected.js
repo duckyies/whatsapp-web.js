@@ -35,6 +35,7 @@ exports.ExposeStore = (moduleRaidStr) => {
     window.Store.ContactMethods = window.mR.findModule('getUserid')[0];
     window.Store.BusinessProfileCollection = window.mR.findModule('BusinessProfileCollection')[0].BusinessProfileCollection;
     window.Store.UploadUtils = window.mR.findModule((module) => (module.default && module.default.encryptAndUpload) ? module.default : null)[0].default;
+    window.Store.UploadLimits = window.mR.findModule('getUploadLimit')[0].getUploadLimit;
     window.Store.UserConstructor = window.mR.findModule((module) => (module.default && module.default.prototype && module.default.prototype.isServer && module.default.prototype.isUser) ? module.default : null)[0].default;
     window.Store.Validators = window.mR.findModule('findLinks')[0];
     window.Store.VCard = window.mR.findModule('vcardFromContactModel')[0];
@@ -160,7 +161,10 @@ exports.LoadUtils = () => {
         return false;
 
     };
-
+    window.WWebJS.getUploadLimits = async (messageType) => {
+        const uploadLimit = window.Store.UploadLimits(messageType);
+        return uploadLimit;
+    };
     window.WWebJS.sendMessage = async (chat, content, options = {}) => {
         let attOptions = {};
         if (options.attachment) {
@@ -169,7 +173,8 @@ exports.LoadUtils = () => {
                 : await window.WWebJS.processMediaData(options.attachment, {
                     forceVoice: options.sendAudioAsVoice,
                     forceDocument: options.sendMediaAsDocument,
-                    forceGif: options.sendVideoAsGif
+                    forceGif: options.sendVideoAsGif,
+                    isViewOnce: options.isViewOnce
                 });
             
             attOptions.caption = options.caption;
@@ -464,12 +469,18 @@ exports.LoadUtils = () => {
         return stickerInfo;
     };
 
-    window.WWebJS.processMediaData = async (mediaInfo, { forceVoice, forceDocument, forceGif }) => {
+    window.WWebJS.processMediaData = async (mediaInfo, { forceVoice, forceDocument, forceGif, isViewOnce }) => {
         const file = window.WWebJS.mediaInfoToFile(mediaInfo);
         const mData = await window.Store.OpaqueData.createFromData(file, file.type);
         const mediaPrep = window.Store.MediaPrep.prepRawMedia(mData, { asDocument: forceDocument });
         const mediaData = await mediaPrep.waitForPrep();
-        const mediaObject = window.Store.MediaObject.getOrCreateMediaObject(mediaData.filehash);
+        const mediaObject = window.Store.MediaObject.getOrCreateMediaObject(mediaData.filehash);       
+        const uploadOrigin = 2;
+        const forwardedFromWeb = false;
+        const maxFileSize = window.Store.UploadLimits(mediaData.type);
+        const mediaKeyInfoTimestamp = Date.now();
+        let mediaKeyInfoKey = await window.WWebJS.generateHash(32);
+        let uploadedMedia = {};
 
         const mediaType = window.Store.MediaTypes.msgToMediaType({
             type: mediaData.type,
@@ -478,6 +489,8 @@ exports.LoadUtils = () => {
 
         if (forceVoice && mediaData.type === 'audio') {
             mediaData.type = 'ptt';
+        }
+            if(mediaData.type === 'ptt' || (mediaData.type === 'audio' && mediaData.mimetype === 'audio/ogg; codecs=opus' && mediaInfo.filesize < maxFileSize)){
             const waveform = mediaObject.contentInfo.waveform;
             mediaData.waveform =
                 waveform ?? await window.WWebJS.generateWaveform(file);
@@ -490,7 +503,13 @@ exports.LoadUtils = () => {
         if (forceDocument) {
             mediaData.type = 'document';
         }
+        if(!isViewOnce){
+            isViewOnce = false;
+        }
 
+        if(mediaInfo.filesize && maxFileSize > mediaInfo.file){
+            throw new Error('Media size (' +mediaInfo.filesize +') exceeds current upload limit (' + maxFileSize + ')');
+        }
         if (!(mediaData.mediaBlob instanceof window.Store.OpaqueData)) {
             mediaData.mediaBlob = await window.Store.OpaqueData.createFromData(mediaData.mediaBlob, mediaData.mediaBlob.type);
         }
@@ -499,15 +518,45 @@ exports.LoadUtils = () => {
         mediaObject.consolidate(mediaData.toJSON());
         mediaData.mediaBlob.autorelease();
 
-        const uploadedMedia = await window.Store.MediaUpload.uploadMedia({
-            mimetype: mediaData.mimetype,
-            mediaObject,
-            mediaType
-        });
+        if(mediaInfo.filesize > 50000000){
+            uploadedMedia = await window.Store.MediaUpload.uploadMedia({
+                mimetype: mediaData.mimetype,
+                mediaObject,
+                mediaType,
+                isViewOnce,
+                uploadOrigin,
+                forwardedFromWeb,
+                mediaKeyInfo: { key: mediaKeyInfoKey, timestamp: mediaKeyInfoTimestamp }
+            });            
+        }
 
-        const mediaEntry = uploadedMedia.mediaEntry;
+        else {
+            uploadedMedia = await window.Store.MediaUpload.uploadMedia({
+                mimetype: mediaData.mimetype,
+                mediaObject,
+                mediaType,
+                isViewOnce,
+                uploadOrigin,
+                forwardedFromWeb
+            });
+        }   
+         let mediaEntry = uploadedMedia.mediaEntry;
         if (!mediaEntry) {
-            throw new Error('upload failed: media entry was not created');
+            if(mediaInfo.filesize > 50000000){
+                uploadedMedia = await window.Store.MediaUpload.uploadMedia({
+                    mimetype: mediaData.mimetype,
+                    mediaObject,
+                    mediaType,
+                    isViewOnce,
+                    uploadOrigin,
+                    forwardedFromWeb
+                });
+                mediaEntry = uploadedMedia.mediaEntry;
+            }
+
+            if(!mediaEntry){
+                throw new Error('upload failed: media entry was not created');
+            }
         }
 
         mediaData.set({
