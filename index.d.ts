@@ -2,6 +2,15 @@
 import { EventEmitter } from 'events'
 import { RequestInit } from 'node-fetch'
 import * as puppeteer from 'puppeteer'
+import DataManager from '../../views/init'
+import { MGame} from '../../monopoly/monopoly'
+import GameManager from '../../commands/unogame/Shard/GameManager'
+import { Ruleset } from '../../types/ruleset'
+import { SnipeItem } from '../../types/client'
+import { BaseUserType } from '../../types/baseuser'
+import baseuser from '../../models/baseuser'
+import { UnoGame } from '../../types/unotypes'
+import Game from '../../commands/unogame/Structures/Game'
 
 declare namespace WAWebJS {
 
@@ -371,6 +380,64 @@ declare namespace WAWebJS {
 
         /** Emitted when the RemoteAuth session is saved successfully on the external Database */
         on(event: 'remote_session_saved', listener: () => void): this
+
+        data : DataManager
+
+        handlers : Map<string, any>
+
+        events : Map<string,any>
+
+        aliases : Map<string,any>
+
+        commands : Map<string,any>
+
+        muted : string[];
+
+        prefix : string;
+
+        mgames : Map<string,MGame>
+
+        sydneyqueue : Array<[Message, string, Message]>
+
+        prefix2 : string;
+
+        gartic : boolean;
+
+        gameManager : GameManager
+        games: { [key: string]: Game; };
+
+        commands2: any;
+
+        commandMap: {[key: string]: string};
+
+        getCommand(name: string): Client["commands2"] | null
+
+        loadCommands(): Promise<void>
+
+        getrules(): Ruleset
+
+        getruleKeys():string[]
+
+        getruleset(): Ruleset
+
+        snipe: SnipeItem[];
+
+        downloading:boolean;
+
+        character:string;
+
+        ingame:boolean;
+
+        ind:boolean;
+
+        cachedUsers: Map<string,BaseUserType>
+
+        battling:boolean
+
+        curr(userID: string): baseuser
+        checkpokemon(msg: Message, member: Contact, pokemons:any , selected: any): Promise<void>
+        //async function (msg:Message, member:Contact, pokemons:any, selected:any): Promise<void>
+
     }
 
     /** Current connection information */
@@ -920,6 +987,8 @@ declare namespace WAWebJS {
         delete: (everyone?: boolean) => Promise<void>,
         /** Downloads and returns the attached message media */
         downloadMedia: () => Promise<MessageMedia>,
+        downloadMedia2: () => Promise<MessageMedia>,
+
         /** Returns the Chat this message was sent in */
         getChat: () => Promise<Chat>,
         /** Returns the Contact this message was sent from */
@@ -1149,6 +1218,8 @@ declare namespace WAWebJS {
      */
     export interface Contact {
         /** Contact's phone number */
+        username?: string,
+        discriminator? : string,
         number: string,
         /** Indicates if the contact is a business contact */
         isBusiness: boolean,
