@@ -3,6 +3,7 @@ import { EventEmitter } from 'events'
 import { RequestInit } from 'node-fetch'
 import * as puppeteer from 'puppeteer'
 import DataManager from '../../views/init'
+import { Shazam } from 'node-shazam'
 import { MGame} from '../../monopoly/monopoly'
 import GameManager from '../../commands/unogame/Shard/GameManager'
 import { Ruleset } from '../../types/ruleset'
@@ -427,6 +428,8 @@ declare namespace WAWebJS {
         character:string;
 
         ingame:boolean;
+
+        shazam: Shazam
 
         ind:boolean;
 
