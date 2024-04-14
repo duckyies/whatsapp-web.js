@@ -30,11 +30,11 @@
   "homepage": "https://wwebjs.dev/",
   "dependencies": {
     "moduleraid": "https://github.com/throwaway5665/moduleRaid.git",
-    "fluent-ffmpeg": "*",
+    "fluent-ffmpeg": "2.1.2",
     "mime": "^3.0.0",
     "node-fetch": "^2.6.9",
     "node-webpmux": "3.1.7",
-    "puppeteer": "*"
+    "puppeteer": "^18.2.1"
   },
   "devDependencies": {
     "@types/node-fetch": "^2.5.12",
