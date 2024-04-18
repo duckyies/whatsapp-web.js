@@ -395,7 +395,7 @@ declare namespace WAWebJS {
         muted : string[];
 
         prefix : string;
-
+        s_prefix: string[];
         mgames : Map<string,MGame>
 
         sydneyqueue : Array<[Message, string, Message]>
