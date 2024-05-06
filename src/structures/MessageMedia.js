@@ -106,7 +106,7 @@ class MessageMedia {
 
         return new MessageMedia(mimetype, res.data, filename, res.size || null);
     }
-    static async toFilePath(filePath) {
+    async toFilePath(filePath) {
         const ext = mime.getExtension(this.mimetype);
         if (fs.existsSync(filePath)) {
             const stat = await fs.promises.stat(filePath);
