@@ -18,6 +18,10 @@ class Message extends Base {
         super(client);
 
         if (data) this._patch(data);
+        this.data = () => { 
+            return data;
+        } 
+           
     }
 
     _patch(data) {
@@ -492,6 +496,38 @@ class Message extends Base {
                 throw e;
             }
         }, this.id._serialized);
+
+        if (!result) return undefined;
+        return new MessageMedia(result.mimetype, result.data, result.filename, result.filesize);
+    }
+
+    async downloadMedia2() {
+        if (!this.hasMedia) {
+            return undefined;
+        }
+        const msg = this.data()
+        const result = await this.client.pupPage.evaluate(async (msg) => {
+
+            const decryptedMedia = await window.Store.DownloadManager.downloadAndMaybeDecrypt({
+                    directPath: msg.directPath,
+                    encFilehash: msg.encFilehash,
+                    filehash: msg.filehash,
+                    mediaKey: msg.mediaKey,
+                    mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                    type: msg.type,
+                    signal: (new AbortController).signal
+                });
+
+                const data = await window.WWebJS.arrayBufferToBase64Async(decryptedMedia);
+
+            return {
+                data: data,
+                mimetype: msg.mimetype,
+                filename: msg.filename,
+                filesize: msg.size
+            };
+
+        }, msg);
 
         if (!result) return undefined;
         return new MessageMedia(result.mimetype, result.data, result.filename, result.filesize);

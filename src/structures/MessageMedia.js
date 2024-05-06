@@ -106,6 +106,23 @@ class MessageMedia {
 
         return new MessageMedia(mimetype, res.data, filename, res.size || null);
     }
+    static async toFilePath(filePath) {
+        const ext = mime.getExtension(this.mimetype);
+        if (fs.existsSync(filePath)) {
+            const stat = await fs.promises.stat(filePath);
+            if (stat.isDirectory()) {
+                if (this.filename){
+                    filePath += this.filename;
+                } else {
+                    throw Error('You passed in a directory but the filename is empty');
+                }
+            }
+        }
+        if (!filePath.includes('.')) {
+            filePath += `.${ext}`;   
+        }
+        await fs.promises.writeFile(filePath, this.data, 'base64');
+    }
 }
 
 module.exports = MessageMedia;

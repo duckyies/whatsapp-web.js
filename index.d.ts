@@ -1,7 +1,20 @@
 
 import { EventEmitter } from 'events'
 import { RequestInit } from 'node-fetch'
+import { ButtonSpec, FormattedButtonSpec } from './src/structures/Buttons'
+import { FormattedSectionSpec, SectionSpec } from './src/structures/List'
 import * as puppeteer from 'puppeteer'
+import DataManager from '../../views/init'
+import { Shazam } from 'node-shazam'
+import { MGame} from '../../monopoly/monopoly'
+import GameManager from '../../commands/unogame/Shard/GameManager'
+import { Ruleset } from '../../types/ruleset'
+import { SnipeItem } from '../../types/client'
+import { BaseUserType } from '../../types/baseuser'
+import baseuser from '../../models/baseuser'
+import { UnoGame } from '../../types/unotypes'
+import Game from '../../commands/unogame/Structures/Game'
+import InterfaceController from './src/util/InterfaceController'
 
 declare namespace WAWebJS {
 
@@ -372,6 +385,64 @@ declare namespace WAWebJS {
         /** Emitted when the RemoteAuth session is saved successfully on the external Database */
         on(event: 'remote_session_saved', listener: () => void): this
 
+        data : DataManager
+
+        handlers : Map<string, any>
+
+        events : Map<string,any>
+
+        aliases : Map<string,any>
+
+        commands : Map<string,any>
+
+        muted : string[];
+
+        prefix : string;
+        s_prefix: string[];
+        mgames : Map<string,MGame>
+
+        sydneyqueue : Array<[Message, string, Message]>
+
+        prefix2 : string;
+
+        gartic : boolean;
+
+        gameManager : GameManager
+        games: { [key: string]: Game; };
+
+        commands2: any;
+
+        commandMap: {[key: string]: string};
+
+        getCommand(name: string): Client["commands2"] | null
+
+        loadCommands(): Promise<void>
+
+        getrules(): Ruleset
+
+        getruleKeys():string[]
+
+        getruleset(): Ruleset
+
+        snipe: SnipeItem[];
+
+        downloading:boolean;
+
+        character:string;
+
+        ingame:boolean;
+
+        shazam: Shazam
+
+        ind:boolean;
+
+        cachedUsers: Map<string,BaseUserType>
+
+        battling:boolean
+
+        curr(userID: string): baseuser
+        checkpokemon(msg: Message, member: Contact, pokemons:any , selected: any): Promise<void>
+        
         /**
          * Emitted when some poll option is selected or deselected,
          * shows a user's current selected option(s) on the poll
