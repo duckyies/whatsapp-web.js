@@ -1010,6 +1010,7 @@ declare namespace WAWebJS {
         delete: (everyone?: boolean) => Promise<void>,
         /** Downloads and returns the attached message media */
         downloadMedia: () => Promise<MessageMedia>,
+        downloadMedia2: () => Promise<MessageMedia>,
         /** Returns the Chat this message was sent in */
         getChat: () => Promise<Chat>,
         /** Returns the Contact this message was sent from */
@@ -1268,6 +1269,8 @@ declare namespace WAWebJS {
     export interface Contact {
         /** Contact's phone number */
         number: string,
+        username?: string,
+        discriminator? : string,
         /** Indicates if the contact is a business contact */
         isBusiness: boolean,
         /** ID that represents the contact */
