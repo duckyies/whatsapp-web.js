@@ -427,6 +427,8 @@ declare namespace WAWebJS {
 
         getCommand(name: string): Client["commands2"] | null
 
+        blacklist: string[]
+
         loadCommands(): Promise<void>
 
         getrules(): Ruleset
