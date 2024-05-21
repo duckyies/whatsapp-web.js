@@ -434,7 +434,7 @@ declare namespace WAWebJS {
         getrules(): Ruleset
 
         getruleKeys():string[]
-
+        blacklist: string[]
         getruleset(): Ruleset
 
         snipe: SnipeItem[];
