@@ -541,7 +541,16 @@ class Message extends Base {
             
             const canRevoke = window.Store.MsgActionChecks.canSenderRevokeMsg(msg) || window.Store.MsgActionChecks.canAdminRevokeMsg(msg);
             if (everyone && canRevoke) {
-                return window.Store.Cmd.sendRevokeMsgs(chat, [msg], { clearMedia: true, type: msg.id.fromMe ? 'Sender' : 'Admin' });
+                try{
+                    if (window.WWebJS.compareWwebVersions(window.Debug.VERSION, '>', '2.3000.0')) {
+                    return window.Store.Cmd.sendRevokeMsgs(chat, { list: [msg], type: 'message' }, { clearMedia: true });
+                } else {
+                    return window.Store.Cmd.sendRevokeMsgs(chat, [msg], { clearMedia: true, type: msg.id.fromMe ? 'Sender' : 'Admin' });
+                }
+            }catch{
+                return window.Store.Cmd.sendRevokeMsgs(chat, { list: [msg], type: 'message' }, { clearMedia: true });
+            }
+
             }
 
             return window.Store.Cmd.sendDeleteMsgs(chat, [msg], true);
