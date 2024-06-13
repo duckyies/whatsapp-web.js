@@ -445,6 +445,8 @@ declare namespace WAWebJS {
 
         ingame:boolean;
 
+        highlights: string[];
+        
         shazam: Shazam
 
         ind:boolean;
