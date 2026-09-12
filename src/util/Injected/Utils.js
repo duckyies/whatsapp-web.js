@@ -3,68 +3,209 @@
 exports.LoadUtils = () => {
     window.WWebJS = {};
 
-    window.WWebJS.forwardMessage = async (chatId, msgId) => {
-        let msg = window.Store.Msg.get(msgId);
-        let chat = window.Store.Chat.get(chatId);
-
-        if (window.WWebJS.compareWwebVersions(window.Debug.VERSION, '>', '2.3000.0')) {
-            return window.Store.ForwardUtils.forwardMessagesToChats([msg], [chat], false);
-        } else {
-            return chat.forwardMessages([msg]);
+    /**
+     * Helper function that compares between two WWeb versions. Its purpose is to help the developer to choose the correct code implementation depending on the comparison value and the WWeb version.
+     * @param {string} lOperand The left operand for the WWeb version string to compare with
+     * @param {string} operator The comparison operator
+     * @param {string} rOperand The right operand for the WWeb version string to compare with
+     * @returns {boolean} Boolean value that indicates the result of the comparison
+     */
+    window.WWebJS.compareWwebVersions = (lOperand, operator, rOperand) => {
+        if (!['>', '>=', '<', '<=', '='].includes(operator)) {
+            throw new (class _ extends Error {
+                constructor(m) {
+                    super(m);
+                    this.name = 'CompareWwebVersionsError';
+                }
+            })('Invalid comparison operator is provided');
         }
+        if (typeof lOperand !== 'string' || typeof rOperand !== 'string') {
+            throw new (class _ extends Error {
+                constructor(m) {
+                    super(m);
+                    this.name = 'CompareWwebVersionsError';
+                }
+            })('A non-string WWeb version type is provided');
+        }
+
+        lOperand = lOperand.replace(/-beta$/, '');
+        rOperand = rOperand.replace(/-beta$/, '');
+
+        while (lOperand.length !== rOperand.length) {
+            lOperand.length > rOperand.length
+                ? (rOperand = rOperand.concat('0'))
+                : (lOperand = lOperand.concat('0'));
+        }
+
+        lOperand = Number(lOperand.replace(/\./g, ''));
+        rOperand = Number(rOperand.replace(/\./g, ''));
+
+        return operator === '>'
+            ? lOperand > rOperand
+            : operator === '>='
+              ? lOperand >= rOperand
+              : operator === '<'
+                ? lOperand < rOperand
+                : operator === '<='
+                  ? lOperand <= rOperand
+                  : operator === '='
+                    ? lOperand === rOperand
+                    : false;
+    };
+
+    /**
+     * Target options object description
+     * @typedef {Object} TargetOptions
+     * @property {string|number} module The target module
+     * @property {string} function The function name to get from a module
+     */
+    /**
+     * Function to modify functions
+     * @param {TargetOptions} target Options specifying the target function to search for modifying
+     * @param {Function} callback Modified function
+     */
+    window.WWebJS.injectToFunction = (target, callback) => {
+        try {
+            let module = window.require(target.module);
+            if (!module) return;
+
+            const path = target.function.split('.');
+            const funcName = path.pop();
+
+            for (const key of path) {
+                if (!module[key]) return;
+                module = module[key];
+            }
+
+            const originalFunction = module[funcName];
+            if (typeof originalFunction !== 'function') return;
+
+            module[funcName] = ((...args) => {
+                try {
+                    return callback(module, originalFunction, ...args);
+                } catch {
+                    return originalFunction.apply(module, args);
+                }
+            }).bind(module);
+        } catch {
+            return;
+        }
+    };
+
+    window.WWebJS.injectToFunction(
+        { module: 'WAWebBackendJobsCommon', function: 'mediaTypeFromProtobuf' },
+        (module, func, ...args) => {
+            const [proto] = args;
+            return proto.locationMessage ? null : func(...args);
+        },
+    );
+
+    window.WWebJS.injectToFunction(
+        { module: 'WAWebE2EProtoUtils', function: 'typeAttributeFromProtobuf' },
+        (module, func, ...args) => {
+            const [proto] = args;
+            return proto.locationMessage || proto.groupInviteMessage
+                ? 'text'
+                : func(...args);
+        },
+    );
+
+    window.WWebJS.forwardMessage = async (chatId, msgId) => {
+        const msg =
+            window.require('WAWebCollections').Msg.get(msgId) ||
+            (
+                await window
+                    .require('WAWebCollections')
+                    .Msg.getMessagesById([msgId])
+            )?.messages?.[0];
+        const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        return await window.require('WAWebChatForwardMessage').forwardMessages({
+            chat: chat,
+            msgs: [msg],
+            multicast: true,
+            includeCaption: true,
+            appendedText: undefined,
+        });
     };
 
     window.WWebJS.sendSeen = async (chatId) => {
-        let chat = window.Store.Chat.get(chatId);
-        if (chat !== undefined) {
-            await window.Store.SendSeen.sendSeen(chat, false);
+        const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        if (chat) {
+            window.require('WAWebStreamModel').Stream.markAvailable();
+            await window.require('WAWebUpdateUnreadChatAction').sendSeen({
+                chat: chat,
+                threadId: undefined,
+            });
+            window.require('WAWebStreamModel').Stream.markUnavailable();
             return true;
         }
         return false;
-
     };
 
     window.WWebJS.sendMessage = async (chat, content, options = {}) => {
-        let attOptions = {};
-        if (options.attachment) {
-            attOptions = options.sendMediaAsSticker
-                ? await window.WWebJS.processStickerData(options.attachment)
-                : await window.WWebJS.processMediaData(options.attachment, {
-                    forceVoice: options.sendAudioAsVoice,
-                    forceDocument: options.sendMediaAsDocument,
-                    forceGif: options.sendVideoAsGif
-                });
-            
-            attOptions.caption = options.caption;
-            content = options.sendMediaAsSticker ? undefined : attOptions.preview;
-            attOptions.isViewOnce = options.isViewOnce;
+        const { getIsNewsletter, getIsBroadcast } =
+            window.require('WAWebChatGetters');
+        const isChannel = getIsNewsletter(chat);
+        const isStatus = getIsBroadcast(chat);
 
-            delete options.attachment;
+        const { findLink } = window.require('WALinkify');
+
+        let mediaOptions = {};
+        if (options.media) {
+            mediaOptions =
+                options.sendMediaAsSticker && !isChannel && !isStatus
+                    ? await window.WWebJS.processStickerData(options.media)
+                    : await window.WWebJS.processMediaData(options.media, {
+                          forceSticker: options.sendMediaAsSticker,
+                          forceGif: options.sendVideoAsGif,
+                          forceVoice: options.sendAudioAsVoice,
+                          forceDocument: options.sendMediaAsDocument,
+                          forceMediaHd: options.sendMediaAsHd,
+                          sendToChannel: isChannel,
+                          sendToStatus: isStatus,
+                      });
+            mediaOptions.caption = options.caption;
+            content = options.sendMediaAsSticker
+                ? undefined
+                : mediaOptions.preview;
+            mediaOptions.isViewOnce = options.isViewOnce;
+            delete options.media;
             delete options.sendMediaAsSticker;
         }
+
         let quotedMsgOptions = {};
         if (options.quotedMessageId) {
-            let quotedMessage = window.Store.Msg.get(options.quotedMessageId);
+            let quotedMessage = window
+                .require('WAWebCollections')
+                .Msg.get(options.quotedMessageId);
+            !quotedMessage &&
+                (quotedMessage = (
+                    await window
+                        .require('WAWebCollections')
+                        .Msg.getMessagesById([options.quotedMessageId])
+                )?.messages?.[0]);
+            if (quotedMessage) {
+                const ReplyUtils = window.require('WAWebMsgReply');
+                const canReply = ReplyUtils
+                    ? ReplyUtils.canReplyMsg(quotedMessage.unsafe())
+                    : quotedMessage.canReply();
 
-            // TODO remove .canReply() once all clients are updated to >= v2.2241.6
-            const canReply = window.Store.ReplyUtils ? 
-                window.Store.ReplyUtils.canReplyMsg(quotedMessage.unsafe()) : 
-                quotedMessage.canReply();
-
-            if (canReply) {
-                quotedMsgOptions = quotedMessage.msgContextInfo(chat);
+                if (canReply) {
+                    quotedMsgOptions = quotedMessage.msgContextInfo(chat);
+                }
+            } else {
+                if (!options.ignoreQuoteErrors) {
+                    throw new Error('Could not get the quoted message.');
+                }
             }
+
+            delete options.ignoreQuoteErrors;
             delete options.quotedMessageId;
         }
 
         if (options.mentionedJidList) {
-            options.mentionedJidList = await Promise.all(
-                options.mentionedJidList.map(async (id) => {
-                    const wid = window.Store.WidFactory.createWid(id);
-                    if (await window.Store.QueryExist(wid)) {
-                        return wid;
-                    }
-                })
+            options.mentionedJidList = options.mentionedJidList.map((id) =>
+                window.require('WAWebWidFactory').createWid(id),
             );
             options.mentionedJidList = options.mentionedJidList.filter(Boolean);
         }
@@ -72,151 +213,256 @@ exports.LoadUtils = () => {
         if (options.groupMentions) {
             options.groupMentions = options.groupMentions.map((e) => ({
                 groupSubject: e.subject,
-                groupJid: window.Store.WidFactory.createWid(e.id)
+                groupJid: window.require('WAWebWidFactory').createWid(e.id),
             }));
         }
 
         let locationOptions = {};
         if (options.location) {
             let { latitude, longitude, description, url } = options.location;
-            url = window.Store.Validators.findLink(url)?.href;
+            url = findLink(url)?.href;
             url && !description && (description = url);
             locationOptions = {
                 type: 'location',
                 loc: description,
                 lat: latitude,
                 lng: longitude,
-                clientUrl: url
+                clientUrl: url,
             };
             delete options.location;
         }
 
-        let _pollOptions = {};
+        let pollOptions = {};
         if (options.poll) {
-            const { pollName, pollOptions } = options.poll;
-            const { allowMultipleAnswers, messageSecret } = options.poll.options;
-            _pollOptions = {
+            const { pollName, pollOptions: _pollOptions } = options.poll;
+            const { allowMultipleAnswers, messageSecret } =
+                options.poll.options;
+            pollOptions = {
+                kind: 'pollCreation',
                 type: 'poll_creation',
                 pollName: pollName,
-                pollOptions: pollOptions,
+                pollOptions: _pollOptions,
                 pollSelectableOptionsCount: allowMultipleAnswers ? 0 : 1,
                 messageSecret:
-                Array.isArray(messageSecret) && messageSecret.length === 32
-                    ? new Uint8Array(messageSecret)
-                    : window.crypto.getRandomValues(new Uint8Array(32))
+                    Array.isArray(messageSecret) && messageSecret.length === 32
+                        ? new Uint8Array(messageSecret)
+                        : window.crypto.getRandomValues(new Uint8Array(32)),
             };
             delete options.poll;
         }
 
+        let eventOptions = {};
+        if (options.event) {
+            const { name, startTimeTs, eventSendOptions } = options.event;
+            const { messageSecret } = eventSendOptions;
+            eventOptions = {
+                type: 'event_creation',
+                eventName: name,
+                eventDescription: eventSendOptions.description,
+                eventStartTime: startTimeTs,
+                eventEndTime: eventSendOptions.endTimeTs,
+                eventLocation: eventSendOptions.location && {
+                    degreesLatitude: 0,
+                    degreesLongitude: 0,
+                    name: eventSendOptions.location,
+                },
+                eventJoinLink:
+                    eventSendOptions.callType === 'none'
+                        ? null
+                        : await window
+                              .require('WAWebGenerateEventCallLink')
+                              .createEventCallLink(
+                                  startTimeTs,
+                                  eventSendOptions.callType,
+                              ),
+                isEventCanceled: eventSendOptions.isEventCanceled,
+                messageSecret:
+                    Array.isArray(messageSecret) && messageSecret.length === 32
+                        ? new Uint8Array(messageSecret)
+                        : window.crypto.getRandomValues(new Uint8Array(32)),
+            };
+            delete options.event;
+        }
+
         let vcardOptions = {};
         if (options.contactCard) {
-            let contact = window.Store.Contact.get(options.contactCard);
+            let contact = await window
+                .require('WAWebCollections')
+                .Contact.find(options.contactCard);
             vcardOptions = {
-                body: window.Store.VCard.vcardFromContactModel(contact).vcard,
+                body: window
+                    .require('WAWebFrontendVcardUtils')
+                    .vcardFromContactModel(contact).vcard,
                 type: 'vcard',
-                vcardFormattedName: contact.formattedName
+                vcardFormattedName: contact.formattedName,
             };
             delete options.contactCard;
         } else if (options.contactCardList) {
-            let contacts = options.contactCardList.map(c => window.Store.Contact.get(c));
-            let vcards = contacts.map(c => window.Store.VCard.vcardFromContactModel(c));
+            let contacts = await Promise.all(
+                options.contactCardList.map((c) =>
+                    window.require('WAWebCollections').Contact.find(c),
+                ),
+            );
+            let vcards = contacts.map((c) =>
+                window
+                    .require('WAWebFrontendVcardUtils')
+                    .vcardFromContactModel(c),
+            );
             vcardOptions = {
                 type: 'multi_vcard',
                 vcardList: vcards,
-                body: undefined
+                body: null,
             };
             delete options.contactCardList;
-        } else if (options.parseVCards && typeof (content) === 'string' && content.startsWith('BEGIN:VCARD')) {
+        } else if (
+            options.parseVCards &&
+            typeof content === 'string' &&
+            content.startsWith('BEGIN:VCARD')
+        ) {
             delete options.parseVCards;
+            delete options.linkPreview;
             try {
-                const parsed = window.Store.VCard.parseVcard(content);
+                const parsed = window
+                    .require('WAWebVcardParsingUtils')
+                    .parseVcard(content);
                 if (parsed) {
                     vcardOptions = {
                         type: 'vcard',
-                        vcardFormattedName: window.Store.VCard.vcardGetNameFromParsed(parsed)
+                        vcardFormattedName: window
+                            .require('WAWebVcardGetNameFromParsed')
+                            .vcardGetNameFromParsed(parsed),
                     };
                 }
-            } catch (_) {
+            } catch (ignoredError) {
                 // not a vcard
             }
         }
 
         if (options.linkPreview) {
             delete options.linkPreview;
-            const link = window.Store.Validators.findLink(content);
+            const link = findLink(content);
             if (link) {
-                let preview = await window.Store.LinkPreview.getLinkPreview(link);
+                let preview = await window
+                    .require('WAWebLinkPreviewChatAction')
+                    .getLinkPreview(link);
                 if (preview && preview.data) {
                     preview = preview.data;
                     preview.preview = true;
                     preview.subtype = 'url';
-                    options = {...options, ...preview};
+                    options = { ...options, ...preview };
                 }
             }
         }
-        
+
         let buttonOptions = {};
-        if(options.buttons){
+        if (options.buttons) {
             let caption;
             if (options.buttons.type === 'chat') {
                 content = options.buttons.body;
                 caption = content;
             } else {
-                caption = options.caption ? options.caption : ' '; //Caption can't be empty
+                caption = options.caption ? options.caption : ' '; // Caption can't be empty
             }
             buttonOptions = {
                 productHeaderImageRejected: false,
                 isFromTemplate: false,
                 isDynamicReplyButtonsMsg: true,
-                title: options.buttons.title ? options.buttons.title : undefined,
-                footer: options.buttons.footer ? options.buttons.footer : undefined,
+                title: options.buttons.title
+                    ? options.buttons.title
+                    : undefined,
+                footer: options.buttons.footer
+                    ? options.buttons.footer
+                    : undefined,
                 dynamicReplyButtons: options.buttons.buttons,
                 replyButtons: options.buttons.buttons,
-                caption: caption
+                caption: caption,
             };
             delete options.buttons;
         }
 
         let listOptions = {};
         if (options.list) {
-            if (window.Store.Conn.platform === 'smba' || window.Store.Conn.platform === 'smbi') {
-                throw '[LT01] Whatsapp business can\'t send this yet';
+            if (
+                window.require('WAWebConnModel').Conn.platform === 'smba' ||
+                window.require('WAWebConnModel').Conn.platform === 'smbi'
+            ) {
+                throw "[LT01] Whatsapp business can't send this yet";
             }
             listOptions = {
                 type: 'list',
                 footer: options.list.footer,
                 list: {
                     ...options.list,
-                    listType: 1
+                    listType: 1,
                 },
-                body: options.list.description
+                body: options.list.description,
             };
             delete options.list;
             delete listOptions.list.footer;
         }
 
-        const meUser = window.Store.User.getMaybeMePnUser();;
-        const newId = await window.Store.MsgKey.newId();
-        
-        const newMsgId = new window.Store.MsgKey({
-            from: meUser,
+        const botOptions = {};
+        if (options.invokedBotWid) {
+            botOptions.messageSecret = window.crypto.getRandomValues(
+                new Uint8Array(32),
+            );
+            botOptions.botMessageSecret = await window
+                .require('WAWebBotMessageSecret')
+                .genBotMsgSecretFromMsgSecret(botOptions.messageSecret);
+            botOptions.invokedBotWid = window
+                .require('WAWebWidFactory')
+                .createWid(options.invokedBotWid);
+            botOptions.botPersonaId = window
+                .require('WAWebBotProfileCollection')
+                .BotProfileCollection.get(options.invokedBotWid).personaId;
+            delete options.invokedBotWid;
+        }
+        const { getMaybeMeLidUser, getMaybeMePnUser } = window.require(
+            'WAWebUserPrefsMeUser',
+        );
+        const lidUser = getMaybeMeLidUser();
+        const meUser = getMaybeMePnUser();
+        const newId = await window.require('WAWebMsgKey').newId();
+        let from = chat.id.isLid() ? lidUser : meUser;
+        let participant;
+
+        if (typeof chat.id?.isGroup === 'function' && chat.id.isGroup()) {
+            from =
+                chat.groupMetadata && chat.groupMetadata.isLidAddressingMode
+                    ? lidUser
+                    : meUser;
+            participant = window
+                .require('WAWebWidFactory')
+                .asUserWidOrThrow(from);
+        }
+
+        if (typeof chat.id?.isStatus === 'function' && chat.id.isStatus()) {
+            participant = window
+                .require('WAWebWidFactory')
+                .asUserWidOrThrow(from);
+        }
+
+        const newMsgKey = new (window.require('WAWebMsgKey'))({
+            from: from,
             to: chat.id,
             id: newId,
-            participant: chat.id.isGroup() ? meUser : undefined,
+            participant: participant,
             selfDir: 'out',
         });
 
         const extraOptions = options.extraOptions || {};
         delete options.extraOptions;
 
-        const ephemeralFields = window.Store.EphemeralFields.getEphemeralFields(chat);
+        const ephemeralFields = window
+            .require('WAWebGetEphemeralFieldsMsgActionsUtils')
+            .getEphemeralFields(chat);
 
         const message = {
             ...options,
-            id: newMsgId,
+            id: newMsgKey,
             ack: 0,
             body: content,
-            from: meUser,
+            from: from,
             to: chat.id,
             local: true,
             self: 'out',
@@ -224,44 +470,128 @@ exports.LoadUtils = () => {
             isNewMsg: true,
             type: 'chat',
             ...ephemeralFields,
-            ...locationOptions,
-            ..._pollOptions,
-            ...attOptions,
-            ...(attOptions.toJSON ? attOptions.toJSON() : {}),
+            ...mediaOptions,
+            ...(mediaOptions.toJSON ? mediaOptions.toJSON() : {}),
             ...quotedMsgOptions,
+            ...locationOptions,
+            ...pollOptions,
+            ...eventOptions,
             ...vcardOptions,
             ...buttonOptions,
             ...listOptions,
-            ...extraOptions
+            ...botOptions,
+            ...extraOptions,
         };
 
-        await window.Store.SendMessage.addAndSendMsgToChat(chat, message);
-         await window.Store.SendMessage.addAndSendMsgToChat(chat, message);
-         const waitForMsg = async (msgId, attempts = 10, delay = 100) => {
-            for (let i = 0; i < attempts; i++) {
-                const msg = window.Store.Msg.get(msgId);
-                if (msg) return msg;
-                await new Promise(res => setTimeout(res, delay));
+        // Bot's won't reply if canonicalUrl is set (linking)
+        if (botOptions) {
+            delete message.canonicalUrl;
+        }
+
+        if (isChannel) {
+            const msg = new (window.require('WAWebCollections').Msg.modelClass)(
+                message,
+            );
+            const msgDataFromMsgModel = window
+                .require('WAWebMsgDataFromModel')
+                .msgDataFromMsgModel(msg);
+            const isMedia = Object.keys(mediaOptions).length > 0;
+            await window
+                .require('WAWebNewsletterUpdateMsgsRecordsJob')
+                .addNewsletterMsgsRecords([msgDataFromMsgModel]);
+            chat.msgs.add(msg);
+            chat.t = msg.t;
+
+            const sendChannelMsgResponse = await window
+                .require('WAWebNewsletterSendMessageJob')
+                .sendNewsletterMessageJob({
+                    msg: msg,
+                    type:
+                        message.type === 'chat'
+                            ? 'text'
+                            : isMedia
+                              ? 'media'
+                              : 'pollCreation',
+                    newsletterJid: chat.id.toJid(),
+                    ...(isMedia
+                        ? {
+                              mediaMetadata: msg.avParams(),
+                              mediaHandle: isMedia
+                                  ? mediaOptions.mediaHandle
+                                  : null,
+                          }
+                        : {}),
+                });
+
+            if (sendChannelMsgResponse.success) {
+                msg.t = sendChannelMsgResponse.ack.t;
+                msg.serverId = sendChannelMsgResponse.serverId;
             }
-            return null;
-        };
+            msg.updateAck(1, true);
+            await window
+                .require('WAWebNewsletterUpdateMsgsRecordsJob')
+                .updateNewsletterMsgRecord(msg);
+            return msg;
+        }
 
-        return await waitForMsg(newMsgId._serialized);
+        if (isStatus) {
+            const { backgroundColor, fontStyle } = extraOptions;
+            const isMedia = Object.keys(mediaOptions).length > 0;
+            const mediaUpdate = (data) =>
+                window.require('WAWebMediaUpdateMsg')(data, mediaOptions);
+            const msg = new (window.require('WAWebCollections').Msg.modelClass)(
+                {
+                    ...message,
+                    author: participant ? participant : null,
+                    messageSecret: window.crypto.getRandomValues(
+                        new Uint8Array(32),
+                    ),
+                    cannotBeRanked: window
+                        .require('WAWebStatusGatingUtils')
+                        .canCheckStatusRankingPosterGating(),
+                },
+            );
+
+            // for text only
+            const statusOptions = {
+                color:
+                    (backgroundColor &&
+                        window.WWebJS.assertColor(backgroundColor)) ||
+                    0xff7acca5,
+                font: (fontStyle >= 0 && fontStyle <= 7 && fontStyle) || 0,
+                text: msg.body,
+            };
+
+            await window
+                .require('WAWebSendStatusMsgAction')
+                [
+                    isMedia
+                        ? 'sendStatusMediaMsgAction'
+                        : 'sendStatusTextMsgAction'
+                ](...(isMedia ? [msg, mediaUpdate] : [statusOptions]));
+
+            return msg;
+        }
+
+        const [msgPromise, sendMsgResultPromise] = window
+            .require('WAWebSendMsgChatAction')
+            .addAndSendMsgToChat(chat, message);
+        await msgPromise;
+
+        if (options.waitUntilMsgSent) await sendMsgResultPromise;
+
+        return window
+            .require('WAWebCollections')
+            .Msg.get(newMsgKey._serialized);
     };
-	
-    window.WWebJS.editMessage = async (msg, content, options = {}) => {
 
+    window.WWebJS.editMessage = async (msg, content, options = {}) => {
         const extraOptions = options.extraOptions || {};
         delete options.extraOptions;
-        
+
         if (options.mentionedJidList) {
-            options.mentionedJidList = await Promise.all(
-                options.mentionedJidList.map(async (id) => {
-                    const wid = window.Store.WidFactory.createWid(id);
-                    if (await window.Store.QueryExist(wid)) {
-                        return wid;
-                    }
-                })
+            options.mentionedJidList = options.mentionedJidList.map((id) =>
+                window.require('WAWebWidFactory').createWid(id),
             );
             options.mentionedJidList = options.mentionedJidList.filter(Boolean);
         }
@@ -269,59 +599,73 @@ exports.LoadUtils = () => {
         if (options.groupMentions) {
             options.groupMentions = options.groupMentions.map((e) => ({
                 groupSubject: e.subject,
-                groupJid: window.Store.WidFactory.createWid(e.id)
+                groupJid: window.require('WAWebWidFactory').createWid(e.id),
             }));
         }
 
         if (options.linkPreview) {
+            const { findLink } = window.require('WALinkify');
             delete options.linkPreview;
-            const link = window.Store.Validators.findLink(content);
+            const link = findLink(content);
             if (link) {
-                const preview = await window.Store.LinkPreview.getLinkPreview(link);
+                const preview = await window
+                    .require('WAWebLinkPreviewChatAction')
+                    .getLinkPreview(link);
                 preview.preview = true;
                 preview.subtype = 'url';
                 options = { ...options, ...preview };
             }
         }
 
-
         const internalOptions = {
             ...options,
-            ...extraOptions
+            ...extraOptions,
         };
 
-        await window.Store.EditMessage.sendMessageEdit(msg, content, internalOptions);
-        return window.Store.Msg.get(msg.id._serialized);
+        await window
+            .require('WAWebSendMessageEditAction')
+            .sendMessageEdit(msg, content, internalOptions);
+        return window.require('WAWebCollections').Msg.get(msg.id._serialized);
     };
 
     window.WWebJS.toStickerData = async (mediaInfo) => {
         if (mediaInfo.mimetype == 'image/webp') return mediaInfo;
 
         const file = window.WWebJS.mediaInfoToFile(mediaInfo);
-        const webpSticker = await window.Store.StickerTools.toWebpSticker(file);
+        const webpSticker = await window
+            .require('WAWebImageUtils')
+            .toWebpSticker(file);
         const webpBuffer = await webpSticker.arrayBuffer();
         const data = window.WWebJS.arrayBufferToBase64(webpBuffer);
 
         return {
             mimetype: 'image/webp',
-            data
+            data,
         };
     };
 
     window.WWebJS.processStickerData = async (mediaInfo) => {
-        if (mediaInfo.mimetype !== 'image/webp') throw new Error('Invalid media type');
+        if (mediaInfo.mimetype !== 'image/webp')
+            throw new Error('Invalid media type');
 
         const file = window.WWebJS.mediaInfoToFile(mediaInfo);
         let filehash = await window.WWebJS.getFileHash(file);
         let mediaKey = await window.WWebJS.generateHash(32);
 
         const controller = new AbortController();
-        const uploadedInfo = await window.Store.UploadUtils.encryptAndUpload({
-            blob: file,
-            type: 'sticker',
-            signal: controller.signal,
-            mediaKey
-        });
+        const uploadedInfo = await window
+            .require('WAWebUploadManager')
+            .encryptAndUpload({
+                blob: file,
+                type: 'sticker',
+                signal: controller.signal,
+                mediaKey,
+                uploadQpl: window
+                    .require('WAWebStartMediaUploadQpl')
+                    .startMediaUploadQpl({
+                        entryPoint: 'MediaUpload',
+                    }),
+            });
 
         const stickerInfo = {
             ...uploadedInfo,
@@ -330,52 +674,108 @@ exports.LoadUtils = () => {
             uploadhash: uploadedInfo.encFilehash,
             size: file.size,
             type: 'sticker',
-            filehash
+            filehash,
         };
 
         return stickerInfo;
     };
 
-    window.WWebJS.processMediaData = async (mediaInfo, { forceVoice, forceDocument, forceGif }) => {
+    window.WWebJS.processMediaData = async (
+        mediaInfo,
+        {
+            forceSticker,
+            forceGif,
+            forceVoice,
+            forceDocument,
+            forceMediaHd,
+            sendToChannel,
+            sendToStatus,
+        },
+    ) => {
         const file = window.WWebJS.mediaInfoToFile(mediaInfo);
-        const mData = await window.Store.OpaqueData.createFromData(file, file.type);
-        const mediaPrep = window.Store.MediaPrep.prepRawMedia(mData, { asDocument: forceDocument });
-        const mediaData = await mediaPrep.waitForPrep();
-        const mediaObject = window.Store.MediaObject.getOrCreateMediaObject(mediaData.filehash);
+        const OpaqueData = window.require('WAWebMediaOpaqueData');
+        const opaqueData = await OpaqueData.createFromData(
+            file,
+            mediaInfo.mimetype,
+        );
+        const mediaParams = {
+            asSticker: forceSticker,
+            asGif: forceGif,
+            isPtt: forceVoice,
+            asDocument: forceDocument,
+        };
 
-        const mediaType = window.Store.MediaTypes.msgToMediaType({
+        if (forceMediaHd && file.type.indexOf('image/') === 0) {
+            mediaParams.maxDimension = 2560;
+        }
+
+        const mediaPrep = window
+            .require('WAWebPrepRawMedia')
+            .prepRawMedia(opaqueData, mediaParams);
+        const mediaData = await mediaPrep.waitForPrep();
+        const mediaObject = window
+            .require('WAWebMediaStorage')
+            .getOrCreateMediaObject(mediaData.filehash);
+        const mediaType = window.require('WAWebMmsMediaTypes').msgToMediaType({
             type: mediaData.type,
-            isGif: mediaData.isGif
+            isGif: mediaData.isGif,
+            isNewsletter: sendToChannel,
         });
 
-        if (forceVoice && mediaData.type === 'audio') {
-            mediaData.type = 'ptt';
+        if (!mediaData.filehash) {
+            throw new Error('media-fault: sendToChat filehash undefined');
+        }
+
+        if (
+            (forceVoice && mediaData.type === 'ptt') ||
+            (sendToStatus && mediaData.type === 'audio')
+        ) {
             const waveform = mediaObject.contentInfo.waveform;
             mediaData.waveform =
-                waveform ?? await window.WWebJS.generateWaveform(file);
+                waveform || (await window.WWebJS.generateWaveform(file));
         }
 
-        if (forceGif && mediaData.type === 'video') {
-            mediaData.isGif = true;
-        }
-
-        if (forceDocument) {
-            mediaData.type = 'document';
-        }
-
-        if (!(mediaData.mediaBlob instanceof window.Store.OpaqueData)) {
-            mediaData.mediaBlob = await window.Store.OpaqueData.createFromData(mediaData.mediaBlob, mediaData.mediaBlob.type);
+        if (!(mediaData.mediaBlob instanceof OpaqueData)) {
+            mediaData.mediaBlob = await OpaqueData.createFromData(
+                mediaData.mediaBlob,
+                mediaData.mediaBlob.type,
+            );
         }
 
         mediaData.renderableUrl = mediaData.mediaBlob.url();
         mediaObject.consolidate(mediaData.toJSON());
-        mediaData.mediaBlob.autorelease();
 
-        const uploadedMedia = await window.Store.MediaUpload.uploadMedia({
+        mediaData.mediaBlob.autorelease();
+        const shouldUseMediaCache = window
+            .require('WAWebMediaDataUtils')
+            .shouldUseMediaCache(
+                window.require('WAWebMmsMediaTypes').castToV4(mediaObject.type),
+            );
+        if (shouldUseMediaCache && mediaData.mediaBlob instanceof OpaqueData) {
+            const formData = mediaData.mediaBlob.formData();
+            window
+                .require('WAWebMediaInMemoryBlobCache')
+                .InMemoryMediaBlobCache.put(mediaObject.filehash, formData);
+        }
+
+        const dataToUpload = {
             mimetype: mediaData.mimetype,
             mediaObject,
-            mediaType
-        });
+            mediaType,
+            ...(sendToChannel
+                ? {
+                      calculateToken: window.require('WAMediaCalculateFilehash')
+                          .getRandomFilehash,
+                  }
+                : {}),
+        };
+
+        const { uploadMedia, uploadUnencryptedMedia } = window.require(
+            'WAWebMediaMmsV4Upload',
+        );
+        const uploadedMedia = !sendToChannel
+            ? await uploadMedia(dataToUpload)
+            : await uploadUnencryptedMedia(dataToUpload);
 
         const mediaEntry = uploadedMedia.mediaEntry;
         if (!mediaEntry) {
@@ -393,34 +793,45 @@ exports.LoadUtils = () => {
             uploadhash: mediaEntry.uploadHash,
             size: mediaObject.size,
             streamingSidecar: mediaEntry.sidecar,
-            firstFrameSidecar: mediaEntry.firstFrameSidecar
+            firstFrameSidecar: mediaEntry.firstFrameSidecar,
+            mediaHandle: sendToChannel ? mediaEntry.handle : null,
         });
 
         return mediaData;
     };
 
-    window.WWebJS.getMessageModel = message => {
+    window.WWebJS.getMessageModel = (message) => {
         const msg = message.serialize();
+
+        const { findLinks } = window.require('WALinkify');
 
         msg.isEphemeral = message.isEphemeral;
         msg.isStatusV3 = message.isStatusV3;
-        msg.links = (window.Store.Validators.findLinks(message.mediaObject ? message.caption : message.body)).map((link) => ({
+        msg.links = findLinks(
+            message.mediaObject ? message.caption : message.body,
+        ).map((link) => ({
             link: link.href,
-            isSuspicious: Boolean(link.suspiciousCharacters && link.suspiciousCharacters.size)
+            isSuspicious: Boolean(
+                link.suspiciousCharacters && link.suspiciousCharacters.size,
+            ),
         }));
 
         if (msg.buttons) {
             msg.buttons = msg.buttons.serialize();
         }
         if (msg.dynamicReplyButtons) {
-            msg.dynamicReplyButtons = JSON.parse(JSON.stringify(msg.dynamicReplyButtons));
+            msg.dynamicReplyButtons = JSON.parse(
+                JSON.stringify(msg.dynamicReplyButtons),
+            );
         }
         if (msg.replyButtons) {
             msg.replyButtons = JSON.parse(JSON.stringify(msg.replyButtons));
         }
 
         if (typeof msg.id.remote === 'object') {
-            msg.id = Object.assign({}, msg.id, { remote: msg.id.remote._serialized });
+            msg.id = Object.assign({}, msg.id, {
+                remote: msg.id.remote._serialized,
+            });
         }
 
         delete msg.pendingAckUpdate;
@@ -428,124 +839,254 @@ exports.LoadUtils = () => {
         return msg;
     };
 
-    window.WWebJS.getPollVoteModel = (vote) => {
-        const _vote = vote.serialize();
-        if (vote.parentMsgKey) {
-            const msg = window.Store.Msg.get(vote.parentMsgKey);
-            msg && (_vote.parentMessage = window.WWebJS.getMessageModel(msg));
-            return _vote;
-        }
-        return null;
-    };
+    window.WWebJS.getChat = async (chatId, { getAsModel = true } = {}) => {
+        const isChannel = /@\w*newsletter\b/.test(chatId);
+        const chatWid = window.require('WAWebWidFactory').createWid(chatId);
+        let chat;
 
-    window.WWebJS.getChatModel = async chat => {
-
-        let res = chat.serialize();
-        res.isGroup = chat.isGroup;
-        res.formattedTitle = chat.formattedTitle;
-        res.isMuted = chat.mute && chat.mute.isMuted;
-
-        if (chat.groupMetadata) {
-            const chatWid = window.Store.WidFactory.createWid((chat.id._serialized));
-            await window.Store.GroupMetadata.update(chatWid);
-            res.groupMetadata = chat.groupMetadata.serialize();
-        }
-        
-        res.lastMessage = null;
-        if (res.msgs && res.msgs.length) {
-            const lastMessage = chat.lastReceivedKey ? window.Store.Msg.get(chat.lastReceivedKey._serialized) : null;
-            if (lastMessage) {
-                res.lastMessage = window.WWebJS.getMessageModel(lastMessage);
+        if (isChannel) {
+            try {
+                chat = window
+                    .require('WAWebCollections')
+                    .WAWebNewsletterCollection.get(chatId);
+                if (!chat) {
+                    await window
+                        .require('WAWebLoadNewsletterPreviewChatAction')
+                        .loadNewsletterPreviewChat(chatId);
+                    chat = await window
+                        .require('WAWebCollections')
+                        .WAWebNewsletterCollection.find(chatWid);
+                }
+            } catch (ignoredError) {
+                chat = null;
             }
+        } else {
+            chat =
+                window.require('WAWebCollections').Chat.get(chatWid) ||
+                (
+                    await window
+                        .require('WAWebFindChatAction')
+                        .findOrCreateLatestChat(chatWid)
+                )?.chat;
         }
-        
-        delete res.msgs;
-        delete res.msgUnsyncedButtonReplyMsgs;
-        delete res.unsyncedButtonReplies;
 
-        return res;
+        return getAsModel && chat
+            ? await window.WWebJS.getChatModel(chat, { isChannel: isChannel })
+            : chat;
     };
 
-    window.WWebJS.getChat = async chatId => {
-        const chatWid = window.Store.WidFactory.createWid(chatId);
-        const chat = await window.Store.Chat.find(chatWid);
-        return await window.WWebJS.getChatModel(chat);
+    window.WWebJS.getChannelMetadata = async (inviteCode) => {
+        const role = window
+            .require('WAWebNewsletterModelUtils')
+            .getRoleByIdentifier(inviteCode);
+        const response = await window
+            .require('WAWebNewsletterMetadataQueryJob')
+            .queryNewsletterMetadataByInviteCode(inviteCode, role);
+
+        const picUrl =
+            response.newsletterPictureMetadataMixin?.picture[0]
+                ?.queryPictureDirectPathOrEmptyResponseMixinGroup.value
+                .directPath;
+
+        return {
+            id: response.idJid,
+            createdAtTs:
+                response.newsletterCreationTimeMetadataMixin.creationTimeValue,
+            titleMetadata: {
+                title: response.newsletterNameMetadataMixin.nameElementValue,
+                updatedAtTs:
+                    response.newsletterNameMetadataMixin.nameUpdateTime,
+            },
+            descriptionMetadata: {
+                description:
+                    response.newsletterDescriptionMetadataMixin
+                        .descriptionQueryDescriptionResponseMixin.elementValue,
+                updatedAtTs:
+                    response.newsletterDescriptionMetadataMixin
+                        .descriptionQueryDescriptionResponseMixin.updateTime,
+            },
+            inviteLink: `https://whatsapp.com/channel/${response.newsletterInviteLinkMetadataMixin.inviteCode}`,
+            membershipType: role,
+            stateType: response.newsletterStateMetadataMixin.stateType,
+            pictureUrl: picUrl ? `https://pps.whatsapp.net${picUrl}` : null,
+            subscribersCount:
+                response.newsletterSubscribersMetadataMixin.subscribersCount,
+            isVerified:
+                response.newsletterVerificationMetadataMixin
+                    .verificationState === 'verified',
+        };
     };
 
     window.WWebJS.getChats = async () => {
-        const chats = window.Store.Chat.getModelsArray();
-
-        const chatPromises = chats.map(chat => window.WWebJS.getChatModel(chat));
+        const chats = window.require('WAWebCollections').Chat.getModelsArray();
+        const chatPromises = chats.map((chat) =>
+            window.WWebJS.getChatModel(chat),
+        );
         return await Promise.all(chatPromises);
     };
 
-    window.WWebJS.getContactModel = contact => {
+    window.WWebJS.getChannels = async () => {
+        const channels = window
+            .require('WAWebCollections')
+            .WAWebNewsletterCollection.getModelsArray();
+        const channelPromises = channels?.map((channel) =>
+            window.WWebJS.getChatModel(channel, { isChannel: true }),
+        );
+        return await Promise.all(channelPromises);
+    };
+
+    window.WWebJS.getChatModel = async (chat, { isChannel = false } = {}) => {
+        if (!chat) return null;
+
+        const model = chat.serialize();
+        model.isGroup = false;
+        model.isMuted = chat.mute?.expiration !== 0;
+        if (isChannel) {
+            model.isChannel = window
+                .require('WAWebChatGetters')
+                .getIsNewsletter(chat);
+        } else {
+            model.formattedTitle = chat.formattedTitle;
+        }
+
+        if (chat.groupMetadata) {
+            model.isGroup = true;
+            const chatWid = window
+                .require('WAWebWidFactory')
+                .createWid(chat.id._serialized);
+            const groupMetadata =
+                window.require('WAWebCollections').GroupMetadata ||
+                window.require('WAWebCollections').WAWebGroupMetadataCollection;
+            await groupMetadata.update(chatWid);
+            const { toPn } = window.require('WAWebLidMigrationUtils');
+            const serializedMetadata = chat.groupMetadata.serialize();
+            for (const p of serializedMetadata.participants || []) {
+                p.id = toPn(p.id) ?? p.id;
+            }
+            model.groupMetadata = serializedMetadata;
+            model.isReadOnly = chat.groupMetadata.announce;
+        }
+
+        if (chat.newsletterMetadata) {
+            const newsletterMetadata =
+                window.require('WAWebCollections')
+                    .NewsletterMetadataCollection ||
+                window.require('WAWebCollections')
+                    .WAWebNewsletterMetadataCollection;
+            await newsletterMetadata.update(chat.id);
+            model.channelMetadata = chat.newsletterMetadata.serialize();
+            model.channelMetadata.createdAtTs =
+                chat.newsletterMetadata.creationTime;
+        }
+
+        model.lastMessage = null;
+        if (model.msgs && model.msgs.length) {
+            const lastMessage = chat.lastReceivedKey
+                ? window
+                      .require('WAWebCollections')
+                      .Msg.get(chat.lastReceivedKey.$1) ||
+                  (
+                      await window
+                          .require('WAWebCollections')
+                          .Msg.getMessagesById([chat.lastReceivedKey.$1
+
+                          ])
+                  )?.messages?.[0]
+                : null;
+            lastMessage &&
+                (model.lastMessage =
+                    window.WWebJS.getMessageModel(lastMessage));
+        }
+
+        delete model.msgs;
+        delete model.msgUnsyncedButtonReplyMsgs;
+        delete model.unsyncedButtonReplies;
+
+        return model;
+    };
+
+    window.WWebJS.getContactModel = (contact) => {
         let res = contact.serialize();
-        res.isBusiness = contact.isBusiness === undefined ? false : contact.isBusiness;
+
+        const wid = window
+            .require('WAWebWidFactory')
+            .createWidFromWidLike(contact.id);
+        if (wid.isLid() && contact.phoneNumber) {
+            res.id = contact.phoneNumber;
+        }
+
+        res.isBusiness =
+            contact.isBusiness === undefined ? false : contact.isBusiness;
 
         if (contact.businessProfile) {
             res.businessProfile = contact.businessProfile.serialize();
         }
 
-        // TODO: remove useOldImplementation and its checks once all clients are updated to >= v2.2327.4
-        const useOldImplementation
-            = window.WWebJS.compareWwebVersions(window.Debug.VERSION, '<', '2.2327.4');
-
-        res.isMe = useOldImplementation
-            ? contact.isMe
-            : window.Store.ContactMethods.getIsMe(contact);
-        res.isUser = useOldImplementation
-            ? contact.isUser
-            : window.Store.ContactMethods.getIsUser(contact);
-        res.isGroup = useOldImplementation
-            ? contact.isGroup
-            : window.Store.ContactMethods.getIsGroup(contact);
-        res.isWAContact = useOldImplementation
-            ? contact.isWAContact
-            : window.Store.ContactMethods.getIsWAContact(contact);
-        res.isMyContact = useOldImplementation
-            ? contact.isMyContact
-            : window.Store.ContactMethods.getIsMyContact(contact);
         res.isBlocked = contact.isContactBlocked;
-        res.userid = useOldImplementation
-            ? contact.userid
-            : window.Store.ContactMethods.getUserid(contact);
-        res.isEnterprise = useOldImplementation
-            ? contact.isEnterprise
-            : window.Store.ContactMethods.getIsEnterprise(contact);
-        res.verifiedName = useOldImplementation
-            ? contact.verifiedName
-            : window.Store.ContactMethods.getVerifiedName(contact);
-        res.verifiedLevel = useOldImplementation
-            ? contact.verifiedLevel
-            : window.Store.ContactMethods.getVerifiedLevel(contact);
-        res.statusMute = useOldImplementation
-            ? contact.statusMute
-            : window.Store.ContactMethods.getStatusMute(contact);
-        res.name = useOldImplementation
-            ? contact.name
-            : window.Store.ContactMethods.getName(contact);
-        res.shortName = useOldImplementation
-            ? contact.shortName
-            : window.Store.ContactMethods.getShortName(contact);
-        res.pushname = useOldImplementation
-            ? contact.pushname
-            : window.Store.ContactMethods.getPushname(contact);
+        if (!res.isBlocked) {
+            const alt = window
+                .require('WAWebApiContact')
+                .getAlternateUserWid(wid);
+            if (alt) {
+                res.isBlocked = !!window
+                    .require('WAWebCollections')
+                    .Blocklist.get(alt);
+            }
+        }
+
+        const ContactMethods = window.require('WAWebContactGetters');
+        res.isMe = ContactMethods.getIsMe(contact);
+        res.isUser = ContactMethods.getIsUser(contact);
+        res.isGroup = ContactMethods.getIsGroup(contact);
+        res.isWAContact = ContactMethods.getIsWAContact(contact);
+        res.userid = ContactMethods.getUserid(contact);
+        res.verifiedName = ContactMethods.getVerifiedName(contact);
+        res.verifiedLevel = ContactMethods.getVerifiedLevel(contact);
+        res.statusMute = ContactMethods.getStatusMute(contact);
+        res.name = ContactMethods.getName(contact);
+        res.shortName = ContactMethods.getShortName(contact);
+        res.pushname = ContactMethods.getPushname(contact);
+
+        const { getIsMyContact } = window.require(
+            'WAWebFrontendContactGetters',
+        );
+        res.isMyContact = getIsMyContact(contact);
+        res.isEnterprise = ContactMethods.getIsEnterprise(contact);
 
         return res;
     };
 
-    window.WWebJS.getContact = async contactId => {
-        const wid = window.Store.WidFactory.createWid(contactId);
-        const contact = await window.Store.Contact.find(wid);
-        const bizProfile = await window.Store.BusinessProfile.fetchBizProfile(wid);
-        bizProfile.profileOptions && (contact.businessProfile = bizProfile);
+    window.WWebJS.getContact = async (contactId) => {
+        const contactWid = window
+            .require('WAWebWidFactory')
+            .createWid(contactId);
+        const contact = await window
+            .require('WAWebCollections')
+            .Contact.find(contactWid);
+        if (contact.isBusiness || contact.isEnterprise) {
+            const bizProfile = await window
+                .require('WAWebCollections')
+                .BusinessProfile.find(contactWid);
+            bizProfile.profileOptions && (contact.businessProfile = bizProfile);
+        }
         return window.WWebJS.getContactModel(contact);
     };
 
     window.WWebJS.getContacts = () => {
-        const contacts = window.Store.Contact.getModelsArray();
-        return contacts.map(contact => window.WWebJS.getContactModel(contact));
+        const contacts = window
+            .require('WAWebCollections')
+            .Contact.getModelsArray();
+        return Promise.all(
+            contacts.map(async (contact) => {
+                if (contact.isBusiness || contact.isEnterprise) {
+                    await window
+                        .require('WAWebCollections')
+                        .BusinessProfile.find(contact.id)
+                        .catch(() => {});
+                }
+                return window.WWebJS.getContactModel(contact);
+            }),
+        );
     };
 
     window.WWebJS.mediaInfoToFile = ({ data, mimetype, filename }) => {
@@ -560,8 +1101,65 @@ exports.LoadUtils = () => {
         const blob = new Blob([buffer], { type: mimetype });
         return new File([blob], filename, {
             type: mimetype,
-            lastModified: Date.now()
+            lastModified: Date.now(),
         });
+    };
+
+    /**
+     * Resolves the media blob and metadata for a message.
+     * Shared by downloadMedia and downloadMediaStream.
+     * @param {string} msgId
+     * @returns {Promise<{blob: Blob, mimetype: string, filename: string, filesize: number}|null>}
+     */
+    window.WWebJS.resolveMediaBlob = async (msgId) => {
+        const { Msg } = window.require('WAWebCollections');
+        const msg =
+            Msg.get(msgId) ||
+            (await Msg.getMessagesById([msgId]))?.messages?.[0];
+
+        if (
+            !msg ||
+            !msg.mediaData ||
+            msg.mediaData.mediaStage === 'REUPLOADING'
+        ) {
+            return null;
+        }
+
+        // Always call internal downloadMedia - never skip based on
+        // mediaStage, because cache eviction can leave stage=RESOLVED
+        // with empty InMemoryMediaBlobCache.
+        await msg.downloadMedia({
+            downloadEvenIfExpensive: true,
+            rmrReason: 1,
+            isUserInitiated: true,
+        });
+
+        if (
+            msg.mediaData.mediaStage.includes('ERROR') ||
+            msg.mediaData.mediaStage === 'FETCHING'
+        ) {
+            return null;
+        }
+
+        const cached = window
+            .require('WAWebMediaInMemoryBlobCache')
+            .InMemoryMediaBlobCache.get(msg.mediaObject?.filehash);
+
+        let blob;
+        if (cached) {
+            blob = cached;
+        } else if (msg.mediaObject?.mediaBlob) {
+            blob = msg.mediaObject.mediaBlob.forceToBlob();
+        }
+
+        if (!blob) return null;
+
+        return {
+            blob,
+            mimetype: msg.mimetype,
+            filename: msg.filename,
+            filesize: msg.size,
+        };
     };
 
     window.WWebJS.arrayBufferToBase64 = (arrayBuffer) => {
@@ -596,18 +1194,17 @@ exports.LoadUtils = () => {
 
     window.WWebJS.generateHash = async (length) => {
         var result = '';
-        var characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        var characters =
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
         var charactersLength = characters.length;
         for (var i = 0; i < length; i++) {
-            result += characters.charAt(Math.floor(Math.random() * charactersLength));
+            result += characters.charAt(
+                Math.floor(Math.random() * charactersLength),
+            );
         }
         return result;
     };
 
-    /**
-     * Referenced from and modified:
-     * @see https://github.com/wppconnect-team/wa-js/commit/290ebfefe6021b3d17f7fdfdda5545bb0473b26f
-     */
     window.WWebJS.generateWaveform = async (audioFile) => {
         try {
             const audioData = await audioFile.arrayBuffer();
@@ -631,54 +1228,55 @@ exports.LoadUtils = () => {
             const normalizedData = filteredData.map((n) => n * multiplier);
 
             const waveform = new Uint8Array(
-                normalizedData.map((n) => Math.floor(100 * n))
+                normalizedData.map((n) => Math.floor(100 * n)),
             );
 
             return waveform;
-        } catch (e) {
+        } catch (ignoredError) {
             return undefined;
         }
     };
 
     window.WWebJS.sendClearChat = async (chatId) => {
-        let chat = window.Store.Chat.get(chatId);
+        let chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
         if (chat !== undefined) {
-            await window.Store.SendClear.sendClear(chat, false);
+            await window.require('WAWebChatClearBridge').sendClear(chat, false);
             return true;
         }
         return false;
     };
 
     window.WWebJS.sendDeleteChat = async (chatId) => {
-        let chat = window.Store.Chat.get(chatId);
+        let chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
         if (chat !== undefined) {
-            await window.Store.SendDelete.sendDelete(chat);
+            await window.require('WAWebDeleteChatAction').sendDelete(chat);
             return true;
         }
         return false;
     };
 
     window.WWebJS.sendChatstate = async (state, chatId) => {
-        chatId = window.Store.WidFactory.createWid(chatId);
+        chatId = window.require('WAWebWidFactory').createWid(chatId);
 
+        const ChatState = window.require('WAWebChatStateBridge');
         switch (state) {
-        case 'typing':
-            await window.Store.ChatState.sendChatStateComposing(chatId);
-            break;
-        case 'recording':
-            await window.Store.ChatState.sendChatStateRecording(chatId);
-            break;
-        case 'stop':
-            await window.Store.ChatState.sendChatStatePaused(chatId);
-            break;
-        default:
-            throw 'Invalid chatstate';
+            case 'typing':
+                await ChatState.sendChatStateComposing(chatId);
+                break;
+            case 'recording':
+                await ChatState.sendChatStateRecording(chatId);
+                break;
+            case 'stop':
+                await ChatState.sendChatStatePaused(chatId);
+                break;
+            default:
+                throw 'Invalid chatstate';
         }
 
         return true;
     };
 
-    window.WWebJS.getLabelModel = label => {
+    window.WWebJS.getLabelModel = (label) => {
         let res = label.serialize();
         res.hexColor = label.hexColor;
 
@@ -686,28 +1284,34 @@ exports.LoadUtils = () => {
     };
 
     window.WWebJS.getLabels = () => {
-        const labels = window.Store.Label.getModelsArray();
-        return labels.map(label => window.WWebJS.getLabelModel(label));
+        const labels = window
+            .require('WAWebCollections')
+            .Label.getModelsArray();
+        return labels.map((label) => window.WWebJS.getLabelModel(label));
     };
 
     window.WWebJS.getLabel = (labelId) => {
-        const label = window.Store.Label.get(labelId);
+        const label = window.require('WAWebCollections').Label.get(labelId);
         return window.WWebJS.getLabelModel(label);
     };
 
     window.WWebJS.getChatLabels = async (chatId) => {
         const chat = await window.WWebJS.getChat(chatId);
-        return (chat.labels || []).map(id => window.WWebJS.getLabel(id));
+        return (chat.labels || []).map((id) => window.WWebJS.getLabel(id));
     };
 
     window.WWebJS.getOrderDetail = async (orderId, token, chatId) => {
-        const chatWid = window.Store.WidFactory.createWid(chatId);
-        return window.Store.QueryOrder.queryOrder(chatWid, orderId, 80, 80, token);
+        const chatWid = window.require('WAWebWidFactory').createWid(chatId);
+        return window
+            .require('WAWebBizOrderBridge')
+            .queryOrder(chatWid, orderId, 80, 80, token);
     };
 
     window.WWebJS.getProductMetadata = async (productId) => {
-        let sellerId = window.Store.Conn.wid;
-        let product = await window.Store.QueryProduct.queryProduct(sellerId, productId);
+        let sellerId = window.require('WAWebConnModel').Conn.wid;
+        let product = await window
+            .require('WAWebBizProductCatalogBridge')
+            .queryProduct(sellerId, productId);
         if (product && product.data) {
             return product.data;
         }
@@ -716,20 +1320,573 @@ exports.LoadUtils = () => {
     };
 
     window.WWebJS.rejectCall = async (peerJid, id) => {
-        peerJid = peerJid.split('@')[0] + '@s.whatsapp.net';
-        let userId = window.Store.User.getMaybeMePnUser().user + '@s.whatsapp.net';
-        const stanza = window.Store.SocketWap.wap('call', {
-            id: window.Store.SocketWap.generateId(),
-            from: window.Store.SocketWap.USER_JID(userId),
-            to: window.Store.SocketWap.USER_JID(peerJid),
-        }, [
-            window.Store.SocketWap.wap('reject', {
-                'call-id': id,
-                'call-creator': window.Store.SocketWap.USER_JID(peerJid),
-                count: '0',
-            })
-        ]);
-        await window.Store.Socket.deprecatedCastStanza(stanza);
+        const stack = await window.WWebJS.getCallStackInterface();
+        if (stack && typeof stack.rejectCall === 'function') {
+            await stack.rejectCall();
+            return;
+        }
+
+        // Fallback signaling stanza for older WhatsApp Web builds.
+        let userId = window
+            .require('WAWebUserPrefsMeUser')
+            .getMaybeMePnUser()._serialized;
+
+        const stanza = window.require('WAWap').wap(
+            'call',
+            {
+                id: window.require('WAWap').generateId(),
+                from: userId,
+                to: peerJid,
+            },
+            [
+                window.require('WAWap').wap('reject', {
+                    'call-id': id,
+                    'call-creator': peerJid,
+                    count: '0',
+                }),
+            ],
+        );
+        await window.require('WADeprecatedSendIq').deprecatedCastStanza(stanza);
+    };
+
+    window.WWebJS.getCallStackInterface = async () => {
+        return window
+            .require('WAWebVoipStackInterface')
+            .getVoipStackInterface();
+    };
+
+    window.WWebJS.setupCallMediaStream = () => {
+        const store = window.WWebJS;
+        // Route the outgoing microphone through our own graph only while an
+        // injected call is active, so ordinary calls keep using the real
+        // microphone (see teardownCallMediaStream).
+        store._callMediaActive = true;
+
+        if (store._callMedia && store._callMedia.context.state !== 'closed') {
+            return store._callMedia;
+        }
+
+        const AudioContextClass =
+            window.AudioContext || window.webkitAudioContext;
+        const context = new AudioContextClass();
+        const master = context.createGain();
+        master.gain.value = 1;
+
+        store._callMedia = { context, master, destinations: [] };
+
+        // WhatsApp acquires the microphone through this single entry point.
+        // Patch it once so the outgoing audio track is fed from our own graph
+        // instead of a physical device, but only while injection is active so
+        // normal calls are left untouched. A fresh destination is handed out on
+        // every call because WhatsApp stops the track when the stream is
+        // disposed, which would permanently silence a shared destination.
+        const mediaModule = window.require('WAGetUserMedia');
+        if (!mediaModule._wwebjsPatched) {
+            const original = mediaModule.getUserMedia;
+            mediaModule._wwebjsPatched = true;
+            mediaModule.getUserMedia = (constraints) => {
+                const media = window.WWebJS._callMedia;
+                if (
+                    (constraints && constraints.video) ||
+                    !media ||
+                    !window.WWebJS._callMediaActive
+                ) {
+                    return original(constraints);
+                }
+                const destination =
+                    media.context.createMediaStreamDestination();
+                media.master.connect(destination);
+                media.destinations.push(destination);
+                return Promise.resolve(destination.stream);
+            };
+        }
+
+        return store._callMedia;
+    };
+
+    window.WWebJS.teardownCallMediaStream = () => {
+        const media = window.WWebJS._callMedia;
+        window.WWebJS._callMediaActive = false;
+        if (!media) return;
+
+        // Detach the destinations handed out during the call so the next call
+        // starts from a clean graph and the real microphone is used again.
+        for (const destination of media.destinations) {
+            try {
+                media.master.disconnect(destination);
+            } catch {
+                // The destination was already disconnected by WhatsApp.
+            }
+        }
+        media.destinations = [];
+    };
+
+    window.WWebJS.playCallAudio = async (base64) => {
+        const { context, master } = window.WWebJS.setupCallMediaStream();
+        if (context.state === 'suspended') {
+            await context.resume();
+        }
+
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+
+        const buffer = await context.decodeAudioData(bytes.buffer);
+        const source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(master);
+
+        return new Promise((resolve) => {
+            source.onended = () => resolve(buffer.duration);
+            source.start();
+        });
+    };
+
+    window.WWebJS.acceptCall = async (
+        callId,
+        isVideo = false,
+        injectAudio = true,
+        video = {},
+    ) => {
+        if (injectAudio) {
+            window.WWebJS.setupCallMediaStream();
+        }
+        if (isVideo) {
+            window.WWebJS.setupCallVideoStream(video);
+        }
+        const stack = await window.WWebJS.getCallStackInterface();
+        await stack.acceptCall(callId, isVideo);
+        return true;
+    };
+
+    window.WWebJS.endCall = async (callId) => {
+        const stack = await window.WWebJS.getCallStackInterface();
+        const { CALL_TERM_REASON } = window.require(
+            'WAWebWamEnumCallTermReason',
+        );
+        await stack.endCall(callId, CALL_TERM_REASON.ENDED_BY_USER);
+        window.WWebJS.teardownCallMediaStream();
+        return true;
+    };
+
+    window.WWebJS.getOngoingCall = () => {
+        // lastActiveCall keeps pointing at the previous call even after it ends,
+        // so a call in the ended state (0) is treated as no ongoing call.
+        const call = window.require('WAWebCallCollection').lastActiveCall;
+        if (
+            !call ||
+            (typeof call.getState === 'function' && call.getState() === 0)
+        ) {
+            return null;
+        }
+        return call;
+    };
+
+    window.WWebJS.startCall = async (
+        chatId,
+        isVideo = false,
+        waitForAnswer = false,
+        timeout = 60000,
+        injectAudio = true,
+        video = {},
+    ) => {
+        if (injectAudio) {
+            window.WWebJS.setupCallMediaStream();
+        }
+        if (isVideo) {
+            window.WWebJS.setupCallVideoStream(video);
+        }
+
+        let wid;
+        const target = String(chatId);
+        if (target.includes('@')) {
+            wid = window.require('WAWebWidFactory').createWid(target);
+        } else {
+            const result = await window
+                .require('WAWebQueryExistsJob')
+                .queryPhoneExists('+' + target.replace(/\D/g, ''));
+            if (!result || !result.wid) {
+                throw new Error(
+                    'The provided phone number is not registered on WhatsApp',
+                );
+            }
+            wid = result.wid;
+        }
+
+        const { CALL_FROM_UI } = window.require('WAWebWamEnumCallFromUi');
+        await window
+            .require('WAWebVoipStartCall')
+            .startWAWebVoipCall(wid, isVideo, CALL_FROM_UI.CONVERSATION);
+
+        // The call is registered in the collection shortly after the offer is
+        // sent, so wait for the newly placed call to become available before
+        // returning its data.
+        const collection = window.require('WAWebCallCollection');
+        let call = null;
+        for (let i = 0; i < 30 && !call; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            call = window.WWebJS.getOngoingCall();
+        }
+
+        // Optionally block until the callee answers (or the timeout elapses).
+        if (call && waitForAnswer) {
+            const deadline = Date.now() + timeout;
+            while (Date.now() < deadline) {
+                const current = window.WWebJS.getOngoingCall();
+                if (
+                    collection.isInConnectedCall &&
+                    current &&
+                    current.id === call.id
+                ) {
+                    break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            }
+        }
+
+        return call
+            ? {
+                  id: call.id,
+                  peerJid: call.peerJid?._serialized,
+                  isVideo: call.isVideo,
+                  isGroup: call.isGroup,
+                  outgoing: call.outgoing,
+              }
+            : null;
+    };
+
+    window.WWebJS.isCallConnected = (callId) => {
+        const collection = window.require('WAWebCallCollection');
+        return (
+            collection.isInConnectedCall === true &&
+            !!collection.lastActiveCall &&
+            collection.lastActiveCall.id === callId
+        );
+    };
+
+    window.WWebJS.getActiveCall = () => {
+        const call = window.WWebJS.getOngoingCall();
+        if (!call) {
+            return null;
+        }
+        return {
+            id: call.id,
+            peerJid: call.peerJid?._serialized,
+            offerTime: call.offerTime,
+            isVideo: call.isVideo,
+            isGroup: call.isGroup,
+            outgoing: call.outgoing,
+        };
+    };
+
+    window.WWebJS.setupCallVideoStream = (options = {}) => {
+        const store = window.WWebJS;
+        window.WWebJS.setupCallMediaStream();
+        if (store._callVideo) {
+            if (options.orientation) {
+                window.WWebJS.setCallVideoOrientation(options.orientation);
+            }
+            if (options.resolution) {
+                window.WWebJS.setCallVideoResolution(options.resolution);
+            }
+            return store._callVideo;
+        }
+
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+
+        // orientation fixes the outgoing frame shape (WhatsApp locks it for the
+        // whole call); rotate counters the turn WhatsApp applies to a portrait
+        // frame; resolution is the short side of the frame in pixels.
+        const callVideo = {
+            canvas,
+            context,
+            source: null,
+            orientation: 'landscape',
+            resolution: 720,
+            rotate: 0,
+        };
+        store._callVideo = callVideo;
+        window.WWebJS.setCallVideoOrientation(
+            options.orientation || 'landscape',
+        );
+        if (options.resolution) {
+            window.WWebJS.setCallVideoResolution(options.resolution);
+        }
+
+        // Draw the current source (a still image or a playing video) onto the
+        // canvas on a fixed interval. captureStream() reads from the canvas, so
+        // this loop is what actually produces the outgoing frames. setInterval
+        // is used instead of requestAnimationFrame because the tab is often
+        // backgrounded, which throttles animation frames to a crawl.
+        callVideo.timer = setInterval(() => {
+            const video = window.WWebJS._callVideo;
+            // Stop a stale loop if the utils were re-injected (which resets
+            // window.WWebJS) and a newer stream took over.
+            if (video !== callVideo) {
+                clearInterval(callVideo.timer);
+                return;
+            }
+
+            const frameWidth = canvas.width;
+            const frameHeight = canvas.height;
+            context.fillStyle = '#000000';
+            context.fillRect(0, 0, frameWidth, frameHeight);
+
+            const source = video.source;
+            if (!source) {
+                return;
+            }
+
+            const element = source.element;
+            // Chrome occasionally pauses hidden media elements on its own;
+            // resume a clip that is supposed to be playing (a finished
+            // non-looping clip legitimately stays on its last frame).
+            if (source.type === 'video' && element.paused && !element.ended) {
+                element.play().catch(() => {});
+            }
+            const mediaWidth =
+                source.type === 'video'
+                    ? element.videoWidth
+                    : element.naturalWidth;
+            const mediaHeight =
+                source.type === 'video'
+                    ? element.videoHeight
+                    : element.naturalHeight;
+            if (!mediaWidth || !mediaHeight) {
+                return;
+            }
+
+            // When the frame is rotated a quarter turn, the media is fitted
+            // against the swapped dimensions. It is centred and letterboxed so
+            // it always shows in full, whatever its aspect ratio.
+            const turned = Math.abs(video.rotate) % 180 === 90;
+            const fitWidth = turned ? frameHeight : frameWidth;
+            const fitHeight = turned ? frameWidth : frameHeight;
+            const scale = Math.min(
+                fitWidth / mediaWidth,
+                fitHeight / mediaHeight,
+            );
+            const drawWidth = mediaWidth * scale;
+            const drawHeight = mediaHeight * scale;
+            context.save();
+            context.translate(frameWidth / 2, frameHeight / 2);
+            if (video.rotate) {
+                context.rotate((video.rotate * Math.PI) / 180);
+            }
+            context.drawImage(
+                element,
+                -drawWidth / 2,
+                -drawHeight / 2,
+                drawWidth,
+                drawHeight,
+            );
+            context.restore();
+        }, 40);
+
+        // The camera is acquired straight through navigator.mediaDevices (the
+        // microphone goes through WAGetUserMedia instead, see above). Patch it
+        // once so the outgoing video track is fed from our canvas. When audio is
+        // requested alongside the camera it is served from the same graph the
+        // microphone uses, so injected audio is heard on video calls too. A
+        // fresh stream is handed out every time because WhatsApp stops the track
+        // when the stream is disposed.
+        const devices = navigator.mediaDevices;
+        if (devices && !devices._wwebjsPatched) {
+            const original = devices.getUserMedia.bind(devices);
+            devices._wwebjsPatched = true;
+            devices.getUserMedia = (constraints) => {
+                const video = window.WWebJS._callVideo;
+                const media = window.WWebJS._callMedia;
+                if (
+                    !constraints ||
+                    (!constraints.video && !constraints.audio)
+                ) {
+                    return original(constraints);
+                }
+
+                const stream = new MediaStream();
+                if (constraints.video && video) {
+                    stream.addTrack(
+                        video.canvas.captureStream(30).getVideoTracks()[0],
+                    );
+                }
+                if (constraints.audio && media) {
+                    const destination =
+                        media.context.createMediaStreamDestination();
+                    media.master.connect(destination);
+                    media.destinations.push(destination);
+                    stream.addTrack(destination.stream.getAudioTracks()[0]);
+                }
+
+                if (!stream.getTracks().length) {
+                    return original(constraints);
+                }
+                return Promise.resolve(stream);
+            };
+        }
+
+        return store._callVideo;
+    };
+
+    // Fix the outgoing frame orientation for the call. A portrait frame is
+    // pre-rotated because WhatsApp turns a portrait camera to correct for a
+    // landscape-mounted sensor; screen.orientation is aligned to it so that
+    // correction is predictable regardless of the host environment. 'auto'
+    // follows the current source's aspect ratio.
+    window.WWebJS.setCallVideoOrientation = (orientation) => {
+        const video = window.WWebJS._callVideo;
+        if (!video) {
+            return;
+        }
+
+        let mode = orientation;
+        if (mode !== 'portrait' && mode !== 'landscape') {
+            const source = video.source;
+            const element = source && source.element;
+            const mediaWidth =
+                element &&
+                (source.type === 'video'
+                    ? element.videoWidth
+                    : element.naturalWidth);
+            const mediaHeight =
+                element &&
+                (source.type === 'video'
+                    ? element.videoHeight
+                    : element.naturalHeight);
+            mode =
+                mediaWidth && mediaHeight && mediaHeight > mediaWidth
+                    ? 'portrait'
+                    : 'landscape';
+        }
+
+        video.orientation = mode;
+        video.rotate = mode === 'portrait' ? -90 : 0;
+        try {
+            const type =
+                mode === 'portrait' ? 'portrait-primary' : 'landscape-primary';
+            Object.defineProperty(screen.orientation, 'type', {
+                get: () => type,
+                configurable: true,
+            });
+            Object.defineProperty(screen.orientation, 'angle', {
+                get: () => 0,
+                configurable: true,
+            });
+        } catch (ignoredError) {
+            // Some environments do not allow overriding screen.orientation.
+        }
+        window.WWebJS.resizeCallVideoCanvas();
+    };
+
+    window.WWebJS.setCallVideoResolution = (resolution) => {
+        const video = window.WWebJS._callVideo;
+        if (!video || !resolution) {
+            return false;
+        }
+        video.resolution = resolution;
+        window.WWebJS.resizeCallVideoCanvas();
+        return true;
+    };
+
+    // Size the canvas (and therefore the outgoing track) from the chosen
+    // orientation and resolution. The resolution is the short side; the long
+    // side follows a 16:9 frame. WhatsApp caps the encode around 720p, so there
+    // is nothing to gain from going much higher.
+    window.WWebJS.resizeCallVideoCanvas = () => {
+        const video = window.WWebJS._callVideo;
+        if (!video) {
+            return;
+        }
+        const target = Math.min(video.resolution || 720, 1080);
+        // Even dimensions keep the encoder happy.
+        const shortSide = Math.round(target / 2) * 2;
+        const longSide = Math.round((shortSide * 16) / 9 / 2) * 2;
+        const portrait = video.orientation === 'portrait';
+        const width = portrait ? shortSide : longSide;
+        const height = portrait ? longSide : shortSide;
+        if (video.canvas.width !== width || video.canvas.height !== height) {
+            video.canvas.width = width;
+            video.canvas.height = height;
+        }
+    };
+
+    window.WWebJS.showCallImage = async (base64, mimetype) => {
+        const video = window.WWebJS.setupCallVideoStream();
+
+        const image = new Image();
+        await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = () => reject(new Error('Failed to load image'));
+            image.src = `data:${mimetype};base64,${base64}`;
+        });
+
+        window.WWebJS.disposeCallVideoSource();
+        video.source = { type: 'image', element: image };
+        return true;
+    };
+
+    window.WWebJS.playCallVideo = async (base64, mimetype, options = {}) => {
+        const video = window.WWebJS.setupCallVideoStream();
+
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        const url = URL.createObjectURL(
+            new Blob([bytes.buffer], { type: mimetype }),
+        );
+
+        const element = document.createElement('video');
+        element.muted = true;
+        element.playsInline = true;
+        element.loop = options.loop === true;
+        element.src = url;
+        // Chrome keeps a detached media element paused, so the source video has
+        // to live in the document (kept off-screen) for playback to advance.
+        element.style.position = 'fixed';
+        element.style.top = '-9999px';
+        element.style.width = '1px';
+        element.style.height = '1px';
+        document.body.appendChild(element);
+
+        await new Promise((resolve, reject) => {
+            element.onloadedmetadata = resolve;
+            element.onerror = () => reject(new Error('Failed to load video'));
+        });
+
+        window.WWebJS.disposeCallVideoSource();
+        video.source = { type: 'video', element, url };
+
+        // A looping clip never ends, so resolve as soon as it starts playing;
+        // otherwise resolve when it finishes so clips can be chained. The last
+        // frame stays on screen until another source is set.
+        return new Promise((resolve) => {
+            if (element.loop) {
+                element.play().then(() => resolve(element.duration));
+            } else {
+                element.onended = () => resolve(element.duration);
+                element.play();
+            }
+        });
+    };
+
+    // Tear down the current outgoing video source. A playing clip keeps its
+    // element in the document, so it is removed before a new source is set to
+    // avoid piling up hidden video elements.
+    window.WWebJS.disposeCallVideoSource = () => {
+        const video = window.WWebJS._callVideo;
+        const source = video && video.source;
+        if (source && source.type === 'video') {
+            source.element.pause();
+            source.element.remove();
+            if (source.url) {
+                URL.revokeObjectURL(source.url);
+            }
+        }
     };
 
     window.WWebJS.cropAndResizeImage = async (media, options = {}) => {
@@ -739,9 +1896,17 @@ exports.LoadUtils = () => {
         if (options.mimetype && !options.mimetype.includes('image'))
             delete options.mimetype;
 
-        options = Object.assign({ size: 640, mimetype: media.mimetype, quality: .75, asDataUrl: false }, options);
+        options = Object.assign(
+            {
+                size: 640,
+                mimetype: media.mimetype,
+                quality: 0.75,
+                asDataUrl: false,
+            },
+            options,
+        );
 
-        const img = await new Promise ((resolve, reject) => {
+        const img = await new Promise((resolve, reject) => {
             const img = new Image();
             img.onload = () => resolve(img);
             img.onerror = reject;
@@ -761,48 +1926,69 @@ exports.LoadUtils = () => {
 
         const dataUrl = canvas.toDataURL(options.mimetype, options.quality);
 
-        if (options.asDataUrl)
-            return dataUrl;
+        if (options.asDataUrl) return dataUrl;
 
         return Object.assign(media, {
-            mimetype: options.mimeType,
-            data: dataUrl.replace(`data:${options.mimeType};base64,`, '')
+            mimetype: options.mimetype,
+            data: dataUrl.replace(`data:${options.mimetype};base64,`, ''),
         });
     };
 
-    window.WWebJS.setPicture = async (chatid, media) => {
-        const thumbnail = await window.WWebJS.cropAndResizeImage(media, { asDataUrl: true, mimetype: 'image/jpeg', size: 96 });
-        const profilePic = await window.WWebJS.cropAndResizeImage(media, { asDataUrl: true, mimetype: 'image/jpeg', size: 640 });
+    window.WWebJS.setPicture = async (chatId, media) => {
+        const thumbnail = await window.WWebJS.cropAndResizeImage(media, {
+            asDataUrl: true,
+            mimetype: 'image/jpeg',
+            size: 96,
+        });
+        const profilePic = await window.WWebJS.cropAndResizeImage(media, {
+            asDataUrl: true,
+            mimetype: 'image/jpeg',
+            size: 640,
+        });
 
-        const chatWid = window.Store.WidFactory.createWid(chatid);
+        const chatWid = window.require('WAWebWidFactory').createWid(chatId);
         try {
-            const collection = window.Store.ProfilePicThumb.get(chatid);
-            if (!collection.canSet()) return;
+            const collection =
+                window
+                    .require('WAWebCollections')
+                    .ProfilePicThumb.get(chatId) ||
+                (await window
+                    .require('WAWebCollections')
+                    .ProfilePicThumb.find(chatId));
+            if (!collection?.canSet()) return false;
 
-            const res = await window.Store.GroupUtils.sendSetPicture(chatWid, thumbnail, profilePic);
+            const res = await window
+                .require('WAWebContactProfilePicThumbBridge')
+                .sendSetPicture(chatWid, thumbnail, profilePic);
             return res ? res.status === 200 : false;
         } catch (err) {
-            if(err.name === 'ServerStatusCodeError') return false;
+            if (err.name === 'ServerStatusCodeError') return false;
             throw err;
         }
     };
 
     window.WWebJS.deletePicture = async (chatid) => {
-        const chatWid = window.Store.WidFactory.createWid(chatid);
+        const chatWid = window.require('WAWebWidFactory').createWid(chatid);
         try {
-            const collection = window.Store.ProfilePicThumb.get(chatid);
+            const collection = window
+                .require('WAWebCollections')
+                .ProfilePicThumb.get(chatid);
             if (!collection.canDelete()) return;
 
-            const res = await window.Store.GroupUtils.requestDeletePicture(chatWid);
+            const res = await window
+                .require('WAWebContactProfilePicThumbBridge')
+                .requestDeletePicture(chatWid);
             return res ? res.status === 200 : false;
         } catch (err) {
-            if(err.name === 'ServerStatusCodeError') return false;
+            if (err.name === 'ServerStatusCodeError') return false;
             throw err;
         }
     };
-    
+
     window.WWebJS.getProfilePicThumbToBase64 = async (chatWid) => {
-        const profilePicCollection = await window.Store.ProfilePicThumb.find(chatWid);
+        const profilePicCollection = await window
+            .require('WAWebCollections')
+            .ProfilePicThumb.find(chatWid);
 
         const _readImageAsBase64 = (imageBlob) => {
             return new Promise((resolve) => {
@@ -830,69 +2016,60 @@ exports.LoadUtils = () => {
                         return base64Image;
                     }
                 }
-            } catch (error) { /* empty */ }
+            } catch (ignoredError) {
+                /* empty */
+            }
         }
         return undefined;
     };
 
-    window.WWebJS.getAddParticipantsRpcResult = async (groupMetadata, groupWid, participantWid) => {
-        const participantLidArgs = groupMetadata?.isLidAddressingMode
-            ? {
-                phoneNumber: participantWid,
-                lid: window.Store.LidUtils.getCurrentLid(participantWid)
-            }
-            : { phoneNumber: participantWid };
+    window.WWebJS.getAddParticipantsRpcResult = async (
+        groupWid,
+        participantWid,
+    ) => {
+        const iqTo = window.require('WAWebWidToJid').widToGroupJid(groupWid);
 
-        const iqTo = window.Store.WidToJid.widToGroupJid(groupWid);
-
-        const participantArgs =
-            participantLidArgs.lid
-                ? [{
-                    participantJid: window.Store.WidToJid.widToUserJid(participantLidArgs.lid),
-                    phoneNumberMixinArgs: {
-                        anyPhoneNumber: window.Store.WidToJid.widToUserJid(participantLidArgs.phoneNumber)
-                    }
-                }]
-                : [{
-                    participantJid: window.Store.WidToJid.widToUserJid(participantLidArgs.phoneNumber)
-                }];
+        const participantArgs = [
+            {
+                participantJid: window
+                    .require('WAWebWidToJid')
+                    .widToUserJid(participantWid),
+            },
+        ];
 
         let rpcResult, resultArgs;
-        const isOldImpl = window.WWebJS.compareWwebVersions(window.Debug.VERSION, '<=', '2.2335.9');
         const data = {
             name: undefined,
             code: undefined,
             inviteV4Code: undefined,
-            inviteV4CodeExp: undefined
+            inviteV4CodeExp: undefined,
         };
 
         try {
-            rpcResult = await window.Store.GroupParticipants.sendAddParticipantsRPC({ participantArgs, iqTo });
-            resultArgs = isOldImpl
-                ? rpcResult.value.addParticipant[0].addParticipantsParticipantMixins
-                : rpcResult.value.addParticipant[0]
+            rpcResult = await window
+                .require('WASmaxGroupsAddParticipantsRPC')
+                .sendAddParticipantsRPC({ participantArgs, iqTo });
+            resultArgs =
+                rpcResult.value.addParticipant[0]
                     .addParticipantsParticipantAddedOrNonRegisteredWaUserParticipantErrorLidResponseMixinGroup
-                    .value
-                    .addParticipantsParticipantMixins;
-        } catch (err) {
+                    .value.addParticipantsParticipantMixins;
+        } catch (ignoredError) {
             data.code = 400;
             return data;
         }
 
         if (rpcResult.name === 'AddParticipantsResponseSuccess') {
-            const code = resultArgs?.value.error ?? '200';
+            const code = resultArgs?.value.error || '200';
             data.name = resultArgs?.name;
             data.code = +code;
             data.inviteV4Code = resultArgs?.value.addRequestCode;
-            data.inviteV4CodeExp = resultArgs?.value.addRequestExpiration?.toString();
-        }
-
-        else if (rpcResult.name === 'AddParticipantsResponseClientError') {
-            const { code: code } = rpcResult.value.errorAddParticipantsClientErrors.value;
+            data.inviteV4CodeExp =
+                resultArgs?.value.addRequestExpiration?.toString();
+        } else if (rpcResult.name === 'AddParticipantsResponseClientError') {
+            const { code: code } =
+                rpcResult.value.errorAddParticipantsClientErrors.value;
             data.code = +code;
-        }
-
-        else if (rpcResult.name === 'AddParticipantsResponseServerError') {
+        } else if (rpcResult.name === 'AddParticipantsResponseServerError') {
             const { code: code } = rpcResult.value.errorServerErrors.value;
             data.code = +code;
         }
@@ -900,44 +2077,69 @@ exports.LoadUtils = () => {
         return data;
     };
 
-    window.WWebJS.membershipRequestAction = async (groupId, action, requesterIds, sleep) => {
-        const groupWid = window.Store.WidFactory.createWid(groupId);
-        const group = await window.Store.Chat.find(groupWid);
+    window.WWebJS.membershipRequestAction = async (
+        groupId,
+        action,
+        requesterIds,
+        sleep,
+    ) => {
+        const groupWid = window.require('WAWebWidFactory').createWid(groupId);
+        const group = await window
+            .require('WAWebCollections')
+            .Chat.find(groupWid);
         const toApprove = action === 'Approve';
         let membershipRequests;
         let response;
         let result = [];
 
-        await window.Store.GroupQueryAndUpdate(groupWid);
+        await window
+            .require('WAWebGroupQueryJob')
+            .queryAndUpdateGroupMetadataById({ id: groupId });
 
         if (!requesterIds?.length) {
-            membershipRequests = group.groupMetadata.membershipApprovalRequests._models.map(({ id }) => id);
+            membershipRequests =
+                group.groupMetadata.membershipApprovalRequests._models.map(
+                    ({ id }) => id,
+                );
         } else {
             !Array.isArray(requesterIds) && (requesterIds = [requesterIds]);
-            membershipRequests = requesterIds.map(r => window.Store.WidFactory.createWid(r));
+            membershipRequests = requesterIds.map((r) =>
+                window.require('WAWebWidFactory').createWid(r),
+            );
         }
 
         if (!membershipRequests.length) return [];
 
-        const participantArgs = membershipRequests.map(m => ({
+        const participantArgs = membershipRequests.map((m) => ({
             participantArgs: [
                 {
-                    participantJid: window.Store.WidToJid.widToUserJid(m)
-                }
-            ]
+                    participantJid: window
+                        .require('WAWebWidToJid')
+                        .widToUserJid(m),
+                },
+            ],
         }));
 
-        const groupJid = window.Store.WidToJid.widToGroupJid(groupWid);
-        
+        const groupJid = window
+            .require('WAWebWidToJid')
+            .widToGroupJid(groupWid);
+
         const _getSleepTime = (sleep) => {
-            if (!Array.isArray(sleep) || (sleep.length === 2 && sleep[0] === sleep[1])) {
+            if (
+                !Array.isArray(sleep) ||
+                (sleep.length === 2 && sleep[0] === sleep[1])
+            ) {
                 return sleep;
             }
             if (sleep.length === 1) {
                 return sleep[0];
             }
-            sleep[1] - sleep[0] < 100 && (sleep[0] = sleep[1]) && (sleep[1] += 100);
-            return Math.floor(Math.random() * (sleep[1] - sleep[0] + 1)) + sleep[0];
+            sleep[1] - sleep[0] < 100 &&
+                (sleep[0] = sleep[1]) &&
+                (sleep[1] += 100);
+            return (
+                Math.floor(Math.random() * (sleep[1] - sleep[0] + 1)) + sleep[0]
+            );
         };
 
         const membReqResCodes = {
@@ -949,99 +2151,193 @@ exports.LoadUtils = () => {
             408: 'ParticipantTemporarilyBlockedError',
             409: 'ParticipantConflictError',
             412: 'ParticipantParentLinkedGroupsResourceConstraintError',
-            500: 'ParticipantResourceConstraintError'
+            500: 'ParticipantResourceConstraintError',
         };
 
         try {
             for (const participant of participantArgs) {
-                response = await window.Store.MembershipRequestUtils.sendMembershipRequestsActionRPC({
-                    iqTo: groupJid,
-                    [toApprove ? 'approveArgs' : 'rejectArgs']: participant
-                });
+                response = await window
+                    .require('WASmaxGroupsMembershipRequestsActionRPC')
+                    .sendMembershipRequestsActionRPC({
+                        iqTo: groupJid,
+                        [toApprove ? 'approveArgs' : 'rejectArgs']: participant,
+                    });
 
-                if (response.name === 'MembershipRequestsActionResponseSuccess') {
+                if (
+                    response.name === 'MembershipRequestsActionResponseSuccess'
+                ) {
                     const value = toApprove
                         ? response.value.membershipRequestsActionApprove
                         : response.value.membershipRequestsActionReject;
                     if (value?.participant) {
-                        const [_] = value.participant.map(p => {
+                        const [_] = value.participant.map((p) => {
                             const error = toApprove
-                                ? value.participant[0].membershipRequestsActionAcceptParticipantMixins?.value.error
-                                : value.participant[0].membershipRequestsActionRejectParticipantMixins?.value.error;
+                                ? value.participant[0]
+                                      .membershipRequestsActionAcceptParticipantMixins
+                                      ?.value.error
+                                : value.participant[0]
+                                      .membershipRequestsActionRejectParticipantMixins
+                                      ?.value.error;
                             return {
-                                requesterId: window.Store.WidFactory.createWid(p.jid)._serialized,
+                                requesterId: window
+                                    .require('WAWebWidFactory')
+                                    .createWid(p.jid)._serialized,
                                 ...(error
-                                    ? { error: +error, message: membReqResCodes[error] || membReqResCodes.default }
-                                    : { message: `${toApprove ? 'Approved' : 'Rejected'} successfully` })
+                                    ? {
+                                          error: +error,
+                                          message:
+                                              membReqResCodes[error] ||
+                                              membReqResCodes.default,
+                                      }
+                                    : {
+                                          message: `${toApprove ? 'Approved' : 'Rejected'} successfully`,
+                                      }),
                             };
                         });
                         _ && result.push(_);
                     }
                 } else {
                     result.push({
-                        requesterId: window.Store.JidToWid.userJidToUserWid(participant.participantArgs[0].participantJid)._serialized,
-                        message: 'ServerStatusCodeError'
+                        requesterId: window
+                            .require('WAWebJidToWid')
+                            .userJidToUserWid(
+                                participant.participantArgs[0].participantJid,
+                            )._serialized,
+                        message: 'ServerStatusCodeError',
                     });
                 }
 
                 sleep &&
                     participantArgs.length > 1 &&
-                    participantArgs.indexOf(participant) !== participantArgs.length - 1 &&
-                    (await new Promise((resolve) => setTimeout(resolve, _getSleepTime(sleep))));
+                    participantArgs.indexOf(participant) !==
+                        participantArgs.length - 1 &&
+                    (await new Promise((resolve) =>
+                        setTimeout(resolve, _getSleepTime(sleep)),
+                    ));
             }
             return result;
-        } catch (err) {
+        } catch (ignoredError) {
             return [];
         }
     };
 
-    window.WWebJS.pinUnpinMsgAction = async (msgId, action, duration) => {
-        const message = window.Store.Msg.get(msgId);
-        if (!message) return false;
-        const response = await window.Store.pinUnpinMsg(message, action, duration);
-        if (response.messageSendResult === 'OK') return true;
-        return false;
+    window.WWebJS.subscribeToUnsubscribeFromChannel = async (
+        channelId,
+        action,
+        options = {},
+    ) => {
+        const channel = await window.WWebJS.getChat(channelId, {
+            getAsModel: false,
+        });
+
+        if (!channel || channel.newsletterMetadata.membershipType === 'owner')
+            return false;
+        options = {
+            eventSurface: 3,
+            deleteLocalModels: options.deleteLocalModels ?? true,
+        };
+
+        try {
+            if (action === 'Subscribe') {
+                await window
+                    .require('WAWebNewsletterSubscribeAction')
+                    .subscribeToNewsletterAction(channel, options);
+            } else if (action === 'Unsubscribe') {
+                await window
+                    .require('WAWebNewsletterUnsubscribeAction')
+                    .unsubscribeFromNewsletterAction(channel, options);
+            } else return false;
+            return true;
+        } catch (err) {
+            if (err.name === 'ServerStatusCodeError') return false;
+            throw err;
+        }
     };
 
-    /**
-     * Helper function that compares between two WWeb versions. Its purpose is to help the developer to choose the correct code implementation depending on the comparison value and the WWeb version.
-     * @param {string} lOperand The left operand for the WWeb version string to compare with
-     * @param {string} operator The comparison operator
-     * @param {string} rOperand The right operand for the WWeb version string to compare with
-     * @returns {boolean} Boolean value that indicates the result of the comparison
-     */
-    window.WWebJS.compareWwebVersions = (lOperand, operator, rOperand) => {
-        if (!['>', '>=', '<', '<=', '='].includes(operator)) {
-            throw new class _ extends Error {
-                constructor(m) { super(m); this.name = 'CompareWwebVersionsError'; }
-            }('Invalid comparison operator is provided');
+    window.WWebJS.pinUnpinMsgAction = async (msgId, action, duration) => {
+        const message =
+            window.require('WAWebCollections').Msg.get(msgId) ||
+            (
+                await window
+                    .require('WAWebCollections')
+                    .Msg.getMessagesById([msgId])
+            )?.messages?.[0];
+        if (!message) return false;
 
+        if (typeof duration !== 'number') return false;
+
+        const originalFunction = window.require(
+            'WAWebPinMsgConstants',
+        ).getPinExpiryDuration;
+        window.require('WAWebPinMsgConstants').getPinExpiryDuration = () =>
+            duration;
+
+        const response = await window
+            .require('WAWebSendPinMessageAction')
+            .sendPinInChatMsg(message, action, duration);
+
+        window.require('WAWebPinMsgConstants').getPinExpiryDuration =
+            originalFunction;
+
+        return response.messageSendResult === 'OK';
+    };
+
+    window.WWebJS.getStatusModel = (status) => {
+        const res = status.serialize();
+        delete res._msgs;
+        return res;
+    };
+
+    window.WWebJS.getAllStatuses = () => {
+        const statuses = window
+            .require('WAWebCollections')
+            .Status.getModelsArray();
+        return statuses.map((status) => window.WWebJS.getStatusModel(status));
+    };
+
+    window.WWebJS.enforceLidAndPnRetrieval = async (userId) => {
+        const wid = window.require('WAWebWidFactory').createWid(userId);
+        const isLid = wid.server === 'lid';
+
+        let lid = isLid
+            ? wid
+            : window.require('WAWebApiContact').getCurrentLid(wid);
+        let phone = isLid
+            ? window.require('WAWebApiContact').getPhoneNumber(wid)
+            : wid;
+
+        if (!isLid && !lid) {
+            const queryResult = await window
+                .require('WAWebQueryExistsJob')
+                .queryWidExists(wid);
+            if (!queryResult?.wid) return {};
+            lid = window.require('WAWebApiContact').getCurrentLid(wid);
         }
-        if (typeof lOperand !== 'string' || typeof rOperand !== 'string') {
-            throw new class _ extends Error {
-                constructor(m) { super(m); this.name = 'CompareWwebVersionsError'; }
-            }('A non-string WWeb version type is provided');
+
+        if (isLid && !phone) {
+            const queryResult = await window
+                .require('WAWebQueryExistsJob')
+                .queryWidExists(wid);
+            if (!queryResult?.wid) return {};
+            phone = window.require('WAWebApiContact').getPhoneNumber(wid);
         }
 
-        lOperand = lOperand.replace(/-beta$/, '');
-        rOperand = rOperand.replace(/-beta$/, '');
+        return { lid, phone };
+    };
 
-        while (lOperand.length !== rOperand.length) {
-            lOperand.length > rOperand.length
-                ? rOperand = rOperand.concat('0')
-                : lOperand = lOperand.concat('0');
+    window.WWebJS.assertColor = (hex) => {
+        let color;
+        if (typeof hex === 'number') {
+            color = hex > 0 ? hex : 0xffffffff + parseInt(hex) + 1;
+        } else if (typeof hex === 'string') {
+            let number = hex.trim().replace('#', '');
+            if (number.length <= 6) {
+                number = 'FF' + number.padStart(6, '0');
+            }
+            color = parseInt(number, 16);
+        } else {
+            throw 'Invalid hex color';
         }
-
-        lOperand = Number(lOperand.replace(/\./g, ''));
-        rOperand = Number(rOperand.replace(/\./g, ''));
-
-        return (
-            operator === '>' ? lOperand > rOperand :
-                operator === '>=' ? lOperand >= rOperand :
-                    operator === '<' ? lOperand < rOperand :
-                        operator === '<=' ? lOperand <= rOperand :
-                            operator === '=' ? lOperand === rOperand :
-                                false
-        );
+        return color;
     };
 };
